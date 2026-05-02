@@ -1,0 +1,27 @@
+BEGIN;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS spotify_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS external_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS playlist_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS external_id VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS playlist_spotify_id VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS total_tracks INTEGER;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS track_count INTEGER;
+
+COMMIT;

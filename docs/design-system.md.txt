@@ -1,0 +1,466 @@
+# Spotify Growth Hub — Design System
+
+Status: Locked (Phase 0)
+
+Notes:
+- Based on Claude Sonnet output
+- Adjusted manually
+- This document defines all UI rules
+- All future UI must follow this system
+
+---
+
+## 1. UX/UI Direction
+
+Here is the complete UX/UI direction for Spotify Growth Hub — your private growth operating system.
+
+1. Product UI Personality
+
+Command-center intelligence — the interface feels like a control room, not a music app. Every screen communicates status, momentum, and decisions at a glance.
+Restrained authority — the UI does not shout. It uses silence and space to signal importance. What is highlighted is highlighted for a reason.
+Data-first confidence — numbers, charts, and tables are the primary citizens. Typography and layout serve the data, not the other way around.
+Structured modularity — every screen is composed of clear, named zones. Nothing bleeds into anything else. Information has its place.
+Low emotional temperature — no celebration animations, no confetti, no playful copy. The product respects that users are making real strategic decisions.
+Linear meets Stripe — the navigation and layout precision of Linear, the financial-grade table and metric clarity of Stripe Dashboard.
+Quiet professionalism — the product could sit alongside Notion, Mixpanel, or Hex without looking out of place. It belongs in a serious work environment.
+
+
+2. Visual Design Rules
+Background style
+Three-layer depth system: deepest layer for the page shell (near-black charcoal, not pure black), mid layer for content regions and panels, surface layer for cards and inputs. Each layer differs by only a subtle step — visible on hover or focus, invisible at a glance.
+Card style
+Low-profile raised cards. Slightly lighter than the page background. Single thin border on all four sides. No decorative shadows. Cards are information containers, not UI elements competing for attention. Padding is generous and consistent — never cramped.
+Border usage
+Borders are structural, not decorative. Use them to separate regions, frame cards, and delineate table rows. They should be barely perceptible — just enough contrast to communicate structure. Never use borders to add visual interest.
+Radius style
+Moderate corner radius throughout — enough to feel modern, not so much that it reads as consumer-friendly or playful. Cards and panels share the same radius. Badges and chips use a tighter radius, not fully rounded pills. Tables have no radius on rows.
+Shadow style
+No decorative shadows anywhere. Depth is communicated through background value contrast alone. If a dropdown, tooltip, or floating element needs elevation, a single thin border handles it — no box-shadow cascade.
+Typography hierarchy
+Four levels, strictly enforced:
+
+Page title: large, medium weight, used once per screen
+Section label: small caps or tight uppercase, muted, used to name regions
+Body / data: regular weight, moderate size, maximum legibility
+Meta / helper: small, muted, for supporting context only
+
+Use a single sans-serif typeface throughout. Monospace only for numeric IDs, playlist codes, or data fields that benefit from alignment.
+Spacing rhythm
+Base unit of 4px. All component padding, gap, and margin values are multiples of this unit (8, 12, 16, 24, 32, 48). Consistency is more important than generosity — the rhythm must be felt without being measured.
+Icon style
+Stroke-based line icons only. Uniform stroke weight, no fill icons. Size consistent within a context: 16px inside tables and inputs, 20px in navigation, 24px for standalone section markers. No decorative icons — every icon has a functional label.
+Chart style
+Minimal. Gridlines are light and sparse — just enough to read values. No chart titles inside the chart frame if the section label handles it above. Limited color usage inside charts (see Color System). Axes labeled cleanly, no chart junk. Prefer area charts and bar charts for time-series growth data; small summary sparklines for in-table context.
+Table style
+Dense but legible. Rows are separated by a thin horizontal rule, not alternating zebra colors. Column headers are muted, uppercase or small-caps, with a sort indicator that only appears on hover or when active. Numeric columns right-aligned. Text columns left-aligned. No cell background fills except for status indicators.
+Badge style
+Small, tight, restrained. Used exclusively for status (Active, Paused, Synced, Flagged) and category tags. Two-tone: a muted fill from the semantic color family, text in a darker stop of the same family. Never use a badge for decoration. Maximum one or two badges per row in a table.
+Input style
+Single thin border, no fill or a very subtle one. No heavy box appearance. Focused state indicated by a border color shift and a subtle glow-free ring — just a border change. Placeholder text is muted. Labels sit above, never inside the field as floating labels.
+Button hierarchy
+Three levels, clearly differentiated:
+
+Primary: filled accent color, reserved for one action per screen maximum — the single most important decision
+Secondary: outlined, for supporting actions
+Ghost/text: no border, for tertiary actions and links within tables or cards
+No icon-only buttons without a tooltip. No ambiguous icon buttons.
+
+
+3. UX Rules
+Navigation behavior
+Persistent left sidebar, collapsed to icons on smaller viewports. Navigation items are flat — no nested dropdowns inside the sidebar. Sub-navigation (tabs within a section) lives at the top of the content area, not inside the sidebar. Active state is a subtle accent indicator, not a heavy fill.
+Page structure pattern
+Every page follows a consistent three-zone layout:
+
+Page header bar — title, primary action, and context (date range, current mode)
+Summary row — 3–5 metric cards across the top
+Content body — tables, charts, or cards in a grid below
+
+Never mix sidebar content zones with main content. Each zone has one job.
+Card usage pattern
+Cards group related information only. Do not use cards as decorative containers. A card should be dismissible or expandable only when that action is contextually meaningful. equal height for stat cards within a row — never mixed heights without a clear layout reason.
+Form layout behavior
+Forms are single-column with clearly labeled fields. Grouped logically by function (not alphabetically). Inline validation only for field-level errors. Submit/save always at the bottom, right-aligned. Destructive actions (delete, remove) always separated from save actions with visual distance and a confirmation step.
+Table interaction style
+Row hover state is a subtle background shift — no color change, just lightness. Clickable rows are indicated by a right-facing caret or cursor change. Bulk selection uses a checkbox column that only appears on hover or when one row is already selected. Sort, filter, and column visibility controls are in the table header, not scattered around the page.
+Filter placement
+Filters live directly above the content they control — never in the sidebar for data-specific filters. A filter bar collapses to a summary chip row when filters are active, showing what is applied. Global filters (date range, workspace) live in the page header bar.
+Empty states
+Empty states are functional, not decorative. A short heading, one sentence explaining why the state exists, and one clear action to resolve it. No large illustrations, no motivational copy. Empty tables show column headers still — never a blank white rectangle.
+Status indicators
+Used consistently across all modules: a color dot or badge tied to a fixed status vocabulary (Active, Paused, Synced, Failed, Pending, Archived). The vocabulary is defined once and never varies between modules. Status is always visible in list and table views without hover.
+Alert design behavior
+Alerts appear inline within the relevant section, not as floating toasts stacked in a corner. Persistent alerts (sync failures, API errors) stay visible until resolved. Transient confirmations (saved, applied) appear briefly as a non-intrusive bar under the action that triggered them. No modal dialogs for non-destructive alerts.
+Recommendation / insight placement
+AI support and trend insights appear in a dedicated, clearly labeled section — never injected inline into unrelated table rows. A sidebar panel or a collapsible insight drawer at the bottom of a relevant module. Insights are optional, dismissible, and never dominate the layout.
+
+4. Color System Direction
+Neutral base direction
+Deep charcoal gray as the foundation — warmer than pure black, cooler than brown-gray. The neutral ramp must have at least four visible steps from page background to card surface to border to text. The product lives almost entirely within this neutral ramp.
+Accent color behavior
+A single cool accent — either a restrained teal or a muted indigo-blue. It appears only on: primary action buttons, active navigation state, chart highlight lines, and linked values. It must never appear as background fills on large areas. It is earned through scarcity.
+Success / warning / error usage
+These semantic colors appear only as status indicators (badges, dots, inline alerts) and never as decorative fills. They carry meaning — applying them outside their semantic role destroys trust in the system. Success is muted green, warning is amber, error is muted red. All are desaturated enough to feel at home in a dark professional UI, not alarming or playful.
+Where color should appear
+Status badges, the active navigation indicator, primary action buttons, chart data series (limited to 2–3 colors per chart), alert states, and sparkline highlights.
+Where color should not appear
+Page backgrounds, card backgrounds, table row fills, section headers, body typography, icon fills, input backgrounds, or any area where it would compete with the data itself.
+
+5. Design Risks to Avoid
+
+Overusing the accent color — the moment the accent appears in navigation, buttons, badges, chart lines, and section labels simultaneously, it loses all meaning. It must be rationed.
+Card overload — wrapping every piece of data in a card creates a visually noisy grid. Use cards for grouped summaries only; let tables be tables.
+Consumer music aesthetics bleeding in — album artwork, waveforms, vinyl-inspired typography, or playful iconography will undermine the product's authority. This is not Spotify.
+Inconsistent status vocabulary — using "Active" in one module and "Live" in another, or "Paused" vs "Stopped," erodes trust in the data layer. Define and enforce one vocabulary.
+Overly animated transitions — page slide animations, card flip effects, and loading skeleton theatrics that draw attention to themselves. The UI should not perform.
+Dense small text in tables — in an effort to show more data, cramping table rows below a comfortable reading size. Legibility always wins over density.
+Modal dialogs for everything — using modal popups for filters, quick edits, and confirmations that could be handled inline or in a side panel. Modals break flow.
+Decorative empty states — large illustrated empty states with characters or metaphors that don't match the product's tone. Keep it functional and neutral.
+Injecting AI insights everywhere — surfacing AI recommendations in headers, table cells, sidebar widgets, and tooltips simultaneously. AI is a tool, not a personality. It has one home.
+Shadow and glow overuse — adding drop shadows, glows, and blur effects to achieve "depth" in the dark UI. Depth comes from value contrast alone in this product. Shadows look cheap at scale.
+
+
+6. Final Design Summary
+Spotify Growth Hub — Master Design Brief
+Spotify Growth Hub is a private analytics and operations dashboard for playlist strategy, curation, and release management. Its visual identity is built on restraint, structure, and decision-clarity.
+The interface operates in a dark theme using a warm-neutral charcoal base. Depth is achieved through subtle background value steps — never through shadows or gradients. A single cool accent color (teal or indigo-blue) is used sparingly to denote primary actions, active states, and chart highlights. All other color is semantic: status only.
+The layout follows a consistent three-zone pattern on every screen: page header with primary action, a summary metric row, and a structured content body. Navigation is a persistent left sidebar with flat, icon-accompanied items. Sub-navigation is handled by in-page tabs, not sidebar nesting.
+Typography uses a single sans-serif typeface at four clearly differentiated hierarchy levels. Tables are the primary data surface — dense but legible, with row hover states, consistent alignment, and a strict status vocabulary enforced across all modules. Cards are reserved for grouped summaries. Forms are single-column, validation-inline, and end with a single primary action.
+The product should feel like Linear for its structural precision, Stripe Dashboard for its metric and table quality, and a modern analytics SaaS (Hex, Mixpanel) for its chart restraint. It does not look like a music app. It does not use neon, gradients, playful illustration, or consumer-style UI patterns. Every design decision is evaluated against one question: does this help the user make a faster, better-informed decision?
+
+Here's a visual reference for how the design language maps to a real dashboard surface:
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetThe visual above demonstrates the core design language in action — sidebar nav with icon-only items, the three-zone page structure, metric summary cards, and the table treatment with badges, sparklines, and status vocabulary.
+A few things to observe in the preview:
+The expanded sidebar (icon + label) by default with a clear active state (teal-tinted background, accent color) — no labels needed at this width, no nested menus. The metric row communicates snapshot health immediately — growth deltas in semantic color, nothing decorative. The table is the workhorse: muted column headers, subtle row dividers, right-aligned numerics, and the badge system enforcing a single status vocabulary (Active, Flagged, Paused, Sync Failed) consistently. Sparklines sit in the final column as contextual micro-charts — not interactive, just directional signal. The accent color (teal) appears in exactly three places: active nav item, primary button, and sparkline bars. Nowhere else.
+This is the target feel — structured, legible, and authoritative without any trace of consumer music UI.
+
+---
+
+## 2. UI Kit & Component System
+
+Spotify Growth Hub — UI Kit & Component System Specification
+
+1. Core UI Components
+App Shell
+The outermost layout container. Manages the three-region split: sidebar, topbar, and main content area. It is the only component that sets the page background and overall height/overflow behavior. All other components live inside it. It never scrolls — only the content region within it scrolls.
+Sidebar
+Persistent vertical navigation rail on the left. Contains icon-based nav items with optional labels, a logo mark at the top, and utility actions (AI, Settings) pinned at the bottom. It has two states: collapsed (icon-only, narrow) and expanded (icon + label, wider). State is persisted per session. The sidebar never contains sub-navigation — that belongs in the content area.
+Topbar
+Horizontal bar spanning the content area only (not the sidebar). Contains the current page title, a contextual date-range selector, and space for one primary action button (per page maximum). It is sticky at the top of the content region. It never contains global navigation.
+Page Header
+Sits immediately below the Topbar within a page. Contains the section title, an optional subtitle or description, and secondary actions (export, sync, refresh). Distinct from the Topbar — the Topbar is global chrome, the Page Header is page-specific identity.
+Stat Card
+A compact metric display card. Shows one KPI per card: a label, a primary numeric value, a delta indicator (up/down with semantic color), and an optional trend sparkline. Used in groups of 3–5 across the top of analytics and list pages. Never interactive on its own — no hover expansion.
+Insight Card
+A structured information block for surfacing AI-generated or system-generated recommendations. Contains a title, a short body paragraph, a confidence or relevance tag, and one action link. Distinct from the Stat Card — it surfaces reasoning, not raw metrics. Lives in a dedicated insight zone, never inline in tables.
+Data Table
+The primary data surface of the product. Supports sortable columns, row selection (checkbox), status badges, inline sparklines, and row-level actions (context menu or hover action row). Column headers are fixed. The table body scrolls independently. Supports pagination or infinite scroll depending on dataset size.
+Filter Bar
+A horizontally arranged set of filter controls that sits directly above the data surface it controls. Contains: a search input, dropdown selectors (status, genre, date range), and an active filter chip summary row. Has a clear-all action when filters are applied. Never embedded inside the Topbar or Sidebar.
+Tab Bar
+In-page horizontal tab navigation. Used to switch between views within a single page (e.g., All Playlists / Curation / Sync Log). Tabs are text labels with an active underline indicator in the accent color. Never uses pills or filled tabs. Tab count per page is capped at 6.
+Modal
+A centered overlay dialog for focused tasks: confirmations, short forms, detail previews. Has a header, body, and footer with at most two actions (primary + cancel). Used sparingly — only when the task genuinely requires context isolation. Never used for alerts or simple status messages.
+Drawer
+A side panel that slides in from the right. Used for detail views, expanded record inspection, and longer forms that would break page flow in a modal. Maintains the background page visible and dimmed behind it. Preferred over modals for record editing.
+Form Sections
+Structured form layout blocks. Each section has a section label, an optional description, and a group of related fields. Fields are single-column within a section. Sections are separated by a subtle divider. Never use multi-column form layouts except for paired fields (start date / end date).
+Badge
+A compact inline status or category indicator. Two visual variants: status badges (with a leading dot and semantic color) and category tags (neutral background, muted text). Fixed vocabulary enforced across all modules. Badges appear in table cells, drawer headers, and card metadata rows.
+Toast
+A transient notification bar that appears at the bottom of the screen for non-blocking feedback (saved, synced, applied). Auto-dismisses after 4 seconds. Has an optional undo action. Never stacks more than two toasts simultaneously. Never used for errors requiring action — those use inline alerts.
+Confirmation Dialog
+A Modal variant reserved exclusively for destructive actions (delete, remove, archive). Contains a warning-toned header, a plain-language consequence statement, and two buttons: a destructive primary and a cancel. The destructive action is never the default focused button.
+Chart Card
+A card that wraps a data visualization. Contains: a label, an optional metric summary line, the chart itself, and an optional legend. Chart cards never contain interaction controls beyond hover tooltips. Filters that affect the chart live in the Filter Bar above, not inside the card.
+Selection Toolbar
+A contextual action bar that replaces the Filter Bar when one or more table rows are selected. Shows the selected count and available bulk actions (export, tag, archive, remove). Appears via slide-down animation, disappears when selection is cleared. Never shown simultaneously with the Filter Bar.
+Empty State Block
+A structured placeholder shown when a data surface has no content. Contains: a neutral icon, a short heading, a one-sentence explanation, and one action button. Never uses illustration or decorative imagery. Column headers remain visible in empty tables — the empty state fills the table body only.
+
+2. shadcn/ui Mapping
+Product Componentshadcn/ui Primitive(s)App ShellCustom layout — no direct primitiveSidebarNavigationMenu or custom with SeparatorTopbarCustom — uses Button, Popover for date pickerPage HeaderCustom — uses Button, DropdownMenuStat CardCard (CardContent only, no CardHeader)Insight CardCard with Badge and Button (ghost variant)Data TableTable primitives + Checkbox, DropdownMenu for row actionsFilter BarInput, Select, Popover, Badge (for chips), ButtonTab BarTabs (TabsList + TabsTrigger + TabsContent)ModalDialog (DialogTrigger, DialogContent, DialogHeader, DialogFooter)DrawerSheet (SheetContent side="right")Form SectionsForm + FormField, FormItem, FormLabel, FormMessageBadgeBadge (custom variants: status, category)ToastSonner (preferred) or Toast + ToastProviderConfirmation DialogAlertDialog (AlertDialogAction, AlertDialogCancel)Chart CardCard wrapper + Recharts or custom SVG insideSelection ToolbarCustom — uses Button, Separator, BadgeEmpty State BlockCustom — uses Button (secondary variant)
+Key shadcn/ui configuration notes:
+The Badge component requires custom variants beyond the defaults. Define: status-active, status-paused, status-flagged, status-failed, status-pending, and category as variant strings in badge.tsx configuration. The default shadcn badge variants should not be used as-is.
+The Table component from shadcn provides the semantic structure only. Column sorting logic, row selection state, and inline sparkline rendering are built on top of it — not provided by the primitive.
+The Sheet component is the correct primitive for the Drawer. Set side="right" and a fixed width (not full-screen). The overlay should dim the background without blurring it.
+The Select component should be used for all dropdown filter controls. The native HTML select should not appear anywhere in the product.
+The Form + FormField system from shadcn (built on React Hook Form) should be used for all forms. Never build ad-hoc controlled inputs outside this system.
+
+3. Tailwind System Rules
+Spacing scale behavior
+Use Tailwind's default spacing scale but restrict usage to a defined subset: 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24. Avoid arbitrary spacing values. Padding inside cards and panels is always p-4 or p-5. Gaps between components within a zone use gap-3 or gap-4. Section-level vertical separation uses space-y-6 or space-y-8. Do not use spacing below space-y-2 for adjacent sibling components.
+Container width logic
+The sidebar has a fixed pixel width in both states (collapsed: ~48–56px, expanded: ~220–240px). The content area is fluid, filling the remaining viewport width. content area expands fully constraint on the content area — it expands to fill available space. Individual content zones (forms, detail panels) may have internal max-width constraints to prevent excessive line length, but the page container itself never limits width.
+Grid usage
+Stat card rows use a responsive CSS grid: 2 columns on medium viewports, 4–5 columns on large viewports. Chart card pairs use a 2-column grid. Full-width components (tables, filter bars, page headers) never use grid — they are block-level. Use grid-cols-{n} with gap-3 or gap-4 only. Avoid flex-wrap for multi-card layouts — grid is more predictable.
+Gap rhythm
+Intra-card gap (between label and value inside a card): gap-1 or gap-2. Between cards in a row: gap-3 or gap-4. Between major page sections (metric row → table): gap-6. Between tab content sections: gap-8. Never use gap-10 or above within content areas.
+Responsive behavior
+The product is desktop-first. Define breakpoints with this priority order: lg (primary design target, 1280px+), xl (wide monitors), md (tablet consideration — sidebar collapses, some grids reduce columns). The sm breakpoint is not a design target and should not drive layout decisions. Never design mobile-first and adapt up.
+Border usage
+Use border with a custom low-opacity border color token. Never use border-2 or above for structural borders — only for the one featured/accent card exception. Dividers between sections use border-t or border-b only. Table row dividers use divide-y on the tbody. Card borders are uniform on all four sides. No border-radius-less elements with border-l accent lines — this pattern is not used in this product.
+Radius usage
+Cards and panels: rounded-lg (12px). Badges and chips: rounded (4–6px). Buttons: rounded-md. Input fields: rounded-md. Modals and Drawers: rounded-xl on the dialog container. Tab triggers: no border radius — they use an underline, not a pill shape. Never use rounded-full except for avatar initials circles.
+Typography sizing logic
+Four levels, mapped to Tailwind classes:
+
+Page title: text-lg weight font-medium (14–15px)
+Section / column labels: text-xs + uppercase + tracking-widest + text-muted
+Body / table data: text-xs to text-sm, weight font-normal
+Meta / helper text: text-xs + text-muted, reduced opacity
+
+Never use text-lg, text-xl, or above in the dashboard UI except for the primary numeric value inside Stat Cards (text-2xl font-medium). The UI is information-dense — large text is reserved for numbers that need instant recognition.
+State styling logic
+Hover: background shifts one step lighter using a semi-transparent white overlay (hover:bg-white/5 pattern). Active/pressed: slight scale reduction (active:scale-[0.98]). Focus: ring using the accent color, no browser default outline. Disabled: opacity-40, pointer-events-none, no color change. Selected (table row): background tinted with a very subtle accent wash. Loading: skeleton shimmer using animate-pulse on placeholder shapes, not spinners.
+
+4. Component Priority
+Must-have now — build these before any screen is shippable
+App Shell, Sidebar, Topbar, Page Header, Stat Card, Data Table, Filter Bar, Tab Bar, Badge (all status variants), Toast, Confirmation Dialog (AlertDialog), Empty State Block, Form Sections, Modal (Dialog).
+These components appear on every major tab. Nothing in the product works without them. They define the visual language that all subsequent screens must conform to.
+Should-have soon — build within the first full feature cycle
+Insight Card, Chart Card, Drawer (Sheet), Selection Toolbar, the complete Filter Bar chip summary system, Drawer-based record editing, and the full Badge vocabulary (all status + category variants verified across every tab).
+These components unlock the analytical and management features of the product. Without them, Trends, Releases, and AI Helpers tabs cannot be built.
+Optional later — build when specific features require them
+Advanced chart types beyond line and bar (heatmaps, scatter), multi-step form wizard (if onboarding is added), command palette (Cmd+K quick navigation), notification center panel, inline commenting or annotation (if collaboration features are added), and a data export modal with format selection.
+These are enhancement components. The product is fully functional and shippable without them.
+
+5. Reusable Patterns
+Analytics pages (Dashboard, Trends)
+Structure: Page Header → Stat Card row (4–5 cards) → Chart Card row (1–2 charts, full or half width) → secondary Data Table below. The stat row anchors the page and gives instant orientation. Chart cards visualize the trend behind the stats. The table provides the drill-down detail. Filters live in a filter bar above the chart zone and apply to both charts and the table below. No sidebar panels — the full width is used for data.
+List management pages (Playlists, Releases)
+Structure: Page Header → Filter Bar → Data Table (full width, scrollable body). The table is the primary surface. Stat Cards are optional and appear only if there are meaningful aggregate numbers to show for the current filtered set. Row selection activates the Selection Toolbar. Record detail opens in a Drawer, not a new page. Create/add actions are in the Page Header primary button.
+Table + filters pages (Curation, Trades, Sync)
+Structure: Page Header → Tab Bar (view modes) → Filter Bar → Data Table. The Tab Bar switches between different views of the same dataset (e.g., Curation: Pending / Approved / Rejected). Each tab maintains its own filter state independently. The filter bar remounts with appropriate controls per tab. Table columns change per tab view — column configuration is tab-specific.
+Forms (Settings, Auth, Trade entry, Release entry)
+Structure: Page Header → vertically stacked Form Sections with labeled groups → sticky footer bar with save and cancel actions. Forms never use modals for lengthy input — they use full page or Drawer layouts. Validation errors appear inline below the relevant field. The save button is always a primary button. Destructive form actions (delete account, remove integration) are always in a separate section at the bottom with a Confirmation Dialog gate.
+Status workflows (Sync, Trades, Releases)
+Status is always visible in the table as a Badge. Workflow progression (Pending → In Progress → Complete / Failed) is shown through badge transitions — the badge is the single source of truth for state. Workflow actions (approve, retry, pause) appear as ghost buttons in a row-level action menu (DropdownMenu), not as inline buttons that clutter the table. Bulk status changes use the Selection Toolbar. Status change history is accessible in the Drawer detail view.
+Insights / recommendations blocks (AI Helpers, Dashboard)
+Structure: a dedicated section within a page or a standalone tab, never injected inline into unrelated data surfaces. An insight block contains: a section label ("AI Insights" or "Recommendations"), a scrollable list of Insight Cards, each with confidence level, category badge, summary, and one action. Cards can be dismissed individually. The section can be collapsed. When empty (no insights available), shows a minimal empty state with an explanation — never hides the section entirely as this makes users unsure if the feature exists.
+
+6. UI Consistency Rules
+One primary action per page. The Topbar or Page Header contains exactly one primary button per page at any given time. Secondary actions use outlined or ghost buttons. This rule applies across every tab without exception.
+Status badge vocabulary is fixed and shared. The exact same badge labels, colors, and dot indicators are used for equivalent states across all modules. "Active" in Playlists looks identical to "Active" in Releases. A new status label is never invented module-by-module.
+Tables always show column headers in empty states. An empty table is not a blank space — it shows its header row and an empty state block in the body. This communicates what data belongs here and makes the absence of data meaningful.
+Accent color appears in at most three places per screen. The teal/indigo accent is reserved for: the active navigation item, the primary action button, and active chart lines or selected state indicators. It must not appear in section labels, table cell values, card backgrounds, or decorative elements.
+All numeric values in tables are right-aligned. Text values are left-aligned. Status badges are left-aligned. This rule is never broken — mixed alignment in a table column is always a bug.
+Filters always live above the content they control. Never in the sidebar, never inside a card header, never inside the topbar. The filter bar is always visually adjacent to and above its data surface.
+Loading states use skeleton placeholders, not spinners. Every component that loads asynchronous data shows a skeleton shape matching the expected content layout. Spinners are only used for action feedback (a button confirming an in-progress submission), never for page or section loading.
+Drawers are used for editing; Modals are used for confirming. A form that edits a record lives in a Drawer. A question asking the user to confirm or cancel a destructive action lives in a Modal (AlertDialog). These roles are never swapped.
+Spacing between page sections is consistent per page type. Analytics pages use one spacing rhythm, list pages use another — but within a page type, every instance of that type behaves identically. A new page is never spaced by eye or by gut — it follows the pattern defined for its type.
+Icon weight and size never varies within a context. All icons in the sidebar are the same size. All icons in table row actions are the same size. All icons in badges (the dot is not an icon, but any supplemental icon is) are the same size. Mixing 16px and 20px icons in the same zone is always a defect.
+Toast notifications never carry errors that require action. Toasts are for success and neutral feedback only. An error that the user must respond to (sync failure, auth expiry, missing required field) surfaces inline in the relevant component — not as a toast that auto-dismisses and is forgotten.
+Forms validate on blur, not on submit only. Field-level errors appear when a user leaves a field, not only when they attempt to submit the form. This prevents the jarring "wall of errors" pattern on submit.
+Destructive actions always require a second confirmation. No delete, remove, archive, or disconnect action executes on a single click. The Confirmation Dialog (AlertDialog) is always interposed. This rule has no exceptions regardless of how minor the deletion seems.
+
+---
+
+## 3. Layout & Wireframes
+Spotify Growth Hub — Layout & Wireframe Structure
+
+Tab 1: Dashboard
+Purpose: Central command view. Gives the team an immediate read on overall health across playlists, growth, curation activity, and pending work.
+Primary user goal: Understand what is happening right now and identify what needs attention today.
+Primary action: No single creation action. The primary button is "Refresh Data" or a date range selector that reframes all metrics.
+Secondary actions: Quick-link to any flagged item, export summary report, collapse/expand insight panel.
+Top section: A row of 4–5 Stat Cards spanning full width. Metrics: Total Followers, Active Playlists, Avg Growth Rate (30d), Pending Syncs, Open Trades. Each card shows the value, a delta vs prior period, and a micro sparkline.
+Main content blocks:
+
+Growth chart (line chart, full width or 60% width) showing aggregate follower growth over time with a period selector
+A two-column row below: left is a Curation Activity summary (recent additions, approvals), right is a Release Pipeline summary (upcoming releases, status)
+Below that: a compact Recent Activity table — last 10 significant events across all modules (sync, trade, release, curation) with timestamps and status badges
+
+Right-side panel: A collapsible Insight Panel showing 2–3 AI-generated or rule-based recommendations relevant to current data (e.g., "Midnight Frequencies is down 0.4% — review curation"). Each insight has a one-line summary and a jump-to action.
+Key table/cards/modules: Stat Cards, Growth Chart Card, Recent Activity Table, Insight Cards.
+Recommended filters: Date range selector in the Topbar (applies globally to all Dashboard metrics). No per-section filters — this is a summary view.
+Empty state behavior: If data is not yet connected, show a single centered empty state with a "Connect your Spotify account" action. If data exists but no alerts exist, hide the insight panel or show a "No issues detected" neutral state.
+Notes on hierarchy: The stat row is read first — it must communicate overall health in under 5 seconds. The growth chart is the primary analytical surface. The insight panel is secondary and collapsible. The recent activity table is the lowest hierarchy item — it provides context, not decisions.
+
+Tab 2: Playlists
+Purpose: Master list and management hub for all tracked playlists. The operational home base for the team.
+Primary user goal: Find, review, and manage any playlist. Understand its current status, follower count, growth, and sync state at a glance.
+Primary action: "Add Playlist" button in the Page Header (right-aligned).
+Secondary actions: Export list, bulk archive, trigger manual sync for selected rows.
+Top section: A compact stat row (3 cards): Total Playlists, Total Followers Across All, Playlists Needing Attention (flagged or sync-failed count). Below the stats, a Filter Bar with: search by name, status filter (Active / Paused / Flagged / Sync Failed), genre tag filter, and a date-added range.
+Main content blocks:
+
+Full-width Data Table as the primary surface. Columns: Playlist Name + meta (genre, track count), Status badge, Followers, 30d Growth (%), Last Sync timestamp, Trend sparkline, row-level Actions menu (Edit, Sync, Pause, Archive).
+Table body scrolls independently. Header is sticky.
+Selection Toolbar replaces Filter Bar when rows are selected — shows bulk action options.
+
+Right-side panel: No persistent right panel. Selecting a row or clicking Edit opens a Drawer from the right for record detail and editing. Drawer contains: playlist metadata, full growth history chart, curation log summary, and sync history.
+Key table/cards/modules: Stat Cards (3), Filter Bar, Data Table, Selection Toolbar, Record Drawer.
+Recommended filters: Status, Genre, Growth direction (growing / declining / flat), Last synced (within 24h / 1–7d / 7d+).
+Empty state behavior: Table body shows empty state block with "No playlists added yet" and the "Add Playlist" action. Column headers remain visible.
+Notes on hierarchy: The table is the page. Stats give context. Filters shape the table. The Drawer is where detail lives — never navigate away from this page to view a playlist record.
+
+Tab 3: Curation
+Purpose: Workflow surface for managing what tracks are being added to, removed from, or queued for playlists. Manages the curation logic and decision history.
+Primary user goal: Review pending curation items, approve or reject additions, and track what has been curated and when.
+Primary action: "Queue Track" or "Add Curation Item" button in the Page Header.
+Secondary actions: Bulk approve, bulk reject, export curation log, filter by playlist.
+Top section: Tab Bar with three views: Pending, Approved, Rejected. The active tab determines table content. A stat strip above the Tab Bar shows: Pending Items, Approved This Week, Rejected This Week.
+Main content blocks:
+
+Filter Bar below the Tab Bar: search by track name or artist, filter by playlist, filter by curator (if multi-user), filter by date submitted.
+Full-width Data Table below the Filter Bar. Columns vary by tab:
+
+Pending: Track Name, Artist, Target Playlist, Submitted by, Date, confidence score (if AI-suggested), Actions (Approve / Reject / Defer)
+Approved: Track, Playlist, Approved by, Date Approved, Added to Playlist (yes/no), status
+Rejected: Track, Playlist, Rejected by, Reason (if logged), Date
+
+
+
+Right-side panel: No persistent panel. Row click opens a Drawer with: track metadata, audio preview link (external), playlist context, and approval/rejection action buttons with an optional notes field.
+Key table/cards/modules: Stat strip, Tab Bar, Filter Bar, Data Table with inline actions, Drawer for track review.
+Recommended filters: Target playlist, Date range, Submitted by, AI-suggested vs manually submitted.
+Empty state behavior: Each tab shows its own empty state. Pending empty state: "No items awaiting curation." Approved: "No approved items in this period." Rejected: "No rejected items in this period." All include an explanation sentence and no action button (these states are acceptable outcomes, not errors).
+Notes on hierarchy: The Tab Bar controls the primary view mode — it is the most important navigation element on this page. The table is the workhorse. Inline approve/reject actions in the Pending tab are the most frequent interaction and must be accessible without opening the Drawer for power users.
+
+Tab 4: Trends
+Purpose: Analytical surface for identifying what is growing, what genres or tracks are gaining traction, and where curation opportunities exist. Insight-heavy and read-mostly.
+Primary user goal: Spot emerging trends before they peak and identify curation opportunities that align with growth signals.
+Refresh Data: No creation action. Primary interaction is the date range and segment filter that reframes all visualizations. A secondary "Export Report" action lives in the Page Header.
+Secondary actions: Save a trend snapshot, jump to related playlist, send insight to AI Helpers.
+Top section: A filter control row (not a full filter bar — more of a context selector): time period, genre category, market or region if applicable. These controls apply to the entire page.
+Main content blocks:
+
+A prominent chart zone at the top: one large primary chart (line or area chart) showing trend movement for selected genre or segment over time.
+Below the primary chart: a 2-column grid of smaller Chart Cards. Each card shows a specific sub-trend (e.g., top growing genres, track velocity, playlist growth by category).
+Below the chart grid: a Trend Table. Columns: Trend / Genre / Track, Growth Rate, Volume, Momentum (rising/flat/cooling badge), Related Playlists (count, linkable).
+
+Right-side panel: A collapsible Insight Panel (same pattern as Dashboard). Shows AI-generated trend observations relevant to the currently selected period and segment. Insight cards each have a "View Related Playlist" action.
+Key table/cards/modules: Context selector, Primary Chart Card, Chart Card grid (4 cards), Trend Table, Insight Panel.
+Recommended filters: Time period (7d / 30d / 90d / custom), Genre or category, Market/region (if applicable), Minimum growth threshold.
+Empty state behavior: If no trend data exists for the selected filters, show an inline empty state inside the chart zone and table with a suggestion to broaden the date range or adjust filters. Do not show a page-level empty state — partial data is likely.
+Notes on hierarchy: The primary chart commands the top of the page and sets the analytical context. Chart cards below it provide supporting dimensions. The trend table enables drill-down. The insight panel is additive — it interprets the data visually shown. Users who ignore the insight panel should still get full analytical value from the page.
+
+Tab 5: Trades
+Purpose: Management surface for playlist trade relationships — inbound and outbound placement agreements, trade status tracking, and counterparty management.
+Primary user goal: Know the current state of every active trade, identify trades that need follow-up, and log new trade agreements.
+Primary action: "Log Trade" button in the Page Header.
+Secondary actions: Export trade log, filter by counterparty, mark as completed, flag for review.
+Top section: Stat row (4 cards): Active Trades, Pending Confirmation, Completed (30d), Flagged / At Risk. Below: Tab Bar with views — Active, Pending, Completed, Flagged.
+Main content blocks:
+
+Filter Bar: search by counterparty name or playlist name, status filter (mirrors the Tab Bar view), date range.
+Full-width Data Table. Columns: Counterparty, Our Playlist, Their Playlist, Trade Type (inbound/outbound), Start Date, Status badge, Last Activity, Actions menu (View, Edit, Mark Complete, Flag, Archive).
+Trade entries are not just rows — they represent relationships. Row click opens a Drawer with full trade detail.
+
+Right-side panel: No persistent panel. Trade Drawer (right): counterparty contact info, both playlists with current follower counts, trade timeline/history log, status change controls, and a notes field.
+Key table/cards/modules: Stat Cards (4), Tab Bar, Filter Bar, Data Table, Trade Drawer.
+Recommended filters: Status, Counterparty name, Our playlist involved, Trade direction (inbound/outbound), Date range.
+Empty state behavior: "No active trades logged. Use 'Log Trade' to record your first agreement." shown in the table body. The Flagged tab shows a specific message if nothing is flagged: "No trades flagged — all clear."
+Notes on hierarchy: This is a workflow and record-keeping page. The stat row quickly shows pipeline health. The Tab Bar segments workflow stages. The table shows the work. The Drawer is where the full context lives. No charts are needed on this page — it is purely operational.
+
+Tab 6: Releases
+Purpose: Tracking and planning surface for upcoming and recent music releases relevant to the team's playlists and curation strategy.
+Primary user goal: Know what is releasing soon, assess its relevance to active playlists, and log or update release tracking entries.
+Primary action: "Add Release" button in the Page Header.
+Secondary actions: Export release calendar, filter by relevance/genre, link a release to a playlist.
+Top section: Stat row (3–4 cards): Releases This Week, Upcoming (next 14 days), Releases Added to Playlists, Monitoring (watchlist count). Below: a simple Tab Bar — Upcoming, Recent, Watchlist.
+Main content blocks:
+
+Filter Bar: search by artist or track name, genre filter, release date range, relevance score filter (if AI-scored).
+Full-width Data Table. Columns: Release Name, Artist, Release Date, Genre, Relevance Score or tag, Linked Playlists (count, linkable), Status badge (Upcoming / Released / Added / Skipped), Actions (Link to Playlist, Add to Watchlist, Log Note).
+Optionally: a compact calendar-strip visualization above the table for the next 14 days showing release density — a simple bar/dot timeline, not an interactive full calendar.
+
+Right-side panel: No persistent panel. Row click opens a Drawer: full release metadata, streaming links (external), relevance notes, linked playlists with current follower counts, and a curator note field.
+Key table/cards/modules: Stat Cards, optional 14-day timeline strip, Tab Bar, Filter Bar, Data Table, Release Drawer.
+Recommended filters: Genre, Release date range, Relevance (high / medium / low), Status, Linked to playlist (yes/no).
+Empty state behavior: Upcoming tab empty: "No releases tracked yet. Add a release to start monitoring." Watchlist empty: "Your watchlist is empty — add releases you want to track closely."
+Notes on hierarchy: The timeline strip (if included) is a visual orientation tool, not an interactive calendar. The table does the real work. The Drawer gives full context. Relevance scoring (whether manual or AI-generated) is a key differentiator on this page — it should be a prominent, sortable column.
+
+Tab 7: Sync
+Purpose: Operational monitoring surface for all playlist sync events — manual syncs, automated syncs, failures, and sync history. The error-recovery hub.
+Primary user goal: Know what synced successfully, what failed, and resolve sync failures quickly.
+Primary action: "Trigger Manual Sync" button in the Page Header (applies to selected or all playlists).
+Secondary actions: Retry failed syncs (bulk), view sync log for a specific playlist, export sync history.
+Top section: Stat row (4 cards): Last Sync (timestamp), Successful (last 24h), Failed (last 24h), Pending Queue count. Below: Tab Bar — All Syncs, Failures, Pending, History.
+Main content blocks:
+
+Filter Bar: search by playlist name, status filter (Success / Failed / Pending / Skipped), date range, trigger type (manual / automated).
+Full-width Data Table. Columns: Playlist Name, Trigger Type, Started At, Duration, Status badge, Records Synced, Error Message (if failed — truncated with expand), Actions (Retry, View Log, Dismiss).
+Failed rows should have a visually distinct treatment — the status badge alone is not enough. A subtle background tint (using the error semantic color at very low opacity) on failed rows helps users scan for problems.
+
+Right-side panel: No persistent panel. Row click opens a Drawer: full sync event log (timestamped steps), error details (expanded), affected playlist info, and a Retry action button.
+Key table/cards/modules: Stat Cards (4), Tab Bar, Filter Bar, Data Table with error-tinted rows, Sync Log Drawer.
+Recommended filters: Status, Playlist, Trigger type (manual / auto), Date range, Error type (if categorized).
+Empty state behavior: Failures tab: "No sync failures — everything is running clean." shown with a success-toned neutral indicator. Pending: "No syncs in queue." History: "No sync history for the selected period — adjust your date range."
+Notes on hierarchy: The Failures tab is the most critical view and should be the default if the user arrives via an alert link. Error visibility is the primary design concern — failure rows must be immediately scannable without reading the status badge text. The Pending queue stat card in the top row should link directly to the Pending tab.
+
+Tab 8: AI Helpers
+Purpose: Lightweight AI-powered assistance surface. Surfaces recommendations, answers questions about the data, and helps with curation decisions and trend interpretation.
+Primary user goal: Get actionable insight or guidance without leaving the product or switching to an external AI tool.
+Primary action: A persistent text input at the bottom of the content area (chat-style) for asking the AI a question. Also, a "Generate Insights" button for triggering a fresh analysis of current data.
+Secondary actions: Dismiss individual insight cards, save an insight to a playlist or release record, clear conversation history.
+Top section: A simple Page Header with title ("AI Helpers") and the "Generate Insights" secondary action. No stat row — this page is not metric-driven.
+Main content blocks:
+
+Left or main zone: A scrollable list of Insight Cards grouped by category (Growth Opportunities, Curation Suggestions, Risk Alerts, Trend Observations). Each card: category badge, summary headline, 2–3 sentence body, confidence level indicator, and one contextual action (View Playlist, Review Trend, etc.).
+Below the insight list: a lightweight chat-style interaction panel. Not a full conversational AI — a structured Q&A interface. User types a question ("Which of my playlists is at risk this week?") and the AI responds with a structured answer card. Response history is shown in a scrollable thread above the input.
+
+Right-side panel: Optional: a context panel showing which data sources the AI is currently referencing (Playlists, Trends, Curation Log). This gives users confidence in the AI's reasoning and lets them see scope.
+Key table/cards/modules: Insight Card list (grouped), Q&A thread panel, context source indicator, text input bar.
+Recommended filters: Insight category filter (Growth / Curation / Risk / Trends), Date of generation, Dismissed vs Active toggle.
+Empty state behavior: If no insights have been generated yet: "No insights yet — click Generate Insights to analyze your current data." If the AI has no response to a query: "Not enough data to answer this confidently — try asking about a specific playlist or time period."
+Notes on hierarchy: The insight card list is the primary content. The Q&A panel is secondary but highly visible — it should feel approachable, not intimidating. This tab should feel like a smart colleague surfacing observations, not a chatbot or a generic AI product. Language and card design must reinforce that.
+
+Tab 9: Auth / Settings
+Purpose: Account configuration, integration management, user preferences, and access control. Operational back-of-house.
+Primary user goal: Configure the product, manage Spotify API connection, and set preferences that affect behavior across all tabs.
+Primary action: "Save Changes" (contextual to the active settings section). "Connect Spotify Account" if not yet authenticated.
+Secondary actions: Disconnect integration, change password, export account data, invite team member (if multi-user).
+Top section: A left-side vertical sub-navigation (secondary nav within the page, not the sidebar) listing settings sections: Account, Integrations, Notifications, Appearance, Team (if applicable), Danger Zone. Active section highlighted.
+Main content blocks:
+The settings page uses a two-column layout within the content area: left column is the sub-navigation list, right column is the active section's form content.
+Section breakdown:
+
+Account: Display name, email, password change form. Single-column form with section labels.
+Integrations: Spotify API connection card (status badge showing connected/disconnected, Connect/Disconnect button, last synced timestamp). Future integration slots shown as coming-soon cards.
+Notifications: Toggle switches for notification types (sync failure alerts, trade reminders, weekly digest). Each toggle has a label and a short description.
+Appearance: Theme toggle (dark / system default), date format preference, timezone selector.
+Team: Member list with role badges, invite form, remove member action (with Confirmation Dialog).
+Danger Zone: Delete account, clear all data. Red-tinted section header, destructive buttons, always gated by Confirmation Dialog.
+
+Right-side panel: None. Full content area is used for the active form section.
+Key table/cards/modules: Sub-navigation list, Form Sections, Integration status cards, Toggle switches, Team member table (simple), Confirmation Dialogs for destructive actions.
+Recommended filters: None — settings pages do not use filters.
+Empty state behavior: Team section with no members: "No team members added yet. Invite someone to collaborate." Integrations with nothing connected: "No integrations connected — connect your Spotify account to get started."
+Notes on hierarchy: The sub-navigation is the primary orientation tool on this page. The active section's form is the entire focus — no competing content. The Danger Zone section must be visually separated from the rest using a top border and distinct section label treatment. No stat cards, no charts, no tables (except the simple team member list).
+
+Global App Layout
+Sidebar structure
+Fixed position, full viewport height, left edge of the screen. Two states: collapsed (48–56px wide, icon only) and expanded (220–240px wide, icon + label). Toggle control at the bottom of the sidebar or as a small collapse button at the sidebar's right edge. Top of sidebar: product logo mark (collapsed) or logo + product name (expanded). Navigation items in order: Dashboard, Playlists, Curation, Trends, Trades, Releases, Sync. A visual separator line then: AI Helpers. Bottom-pinned: Settings, user avatar or account indicator. Active state: accent-tinted background on the nav item row, accent-colored icon. Inactive: muted icon color, no background. No nested items, no accordion groups, no tooltips except on collapsed state (tooltip shows item label on hover).
+Topbar structure
+Spans the content area only — it does not overlap the sidebar. Fixed at the top of the content region. Height: compact (48–52px). Left side: current page title (updates per tab). Center: empty or used for a global date-range selector on analytics-heavy pages only (Dashboard, Trends). Right side: one primary action button (page-specific) and optionally a notification indicator (bell icon, badge count). The Topbar never contains navigation links or secondary actions — those belong in the Page Header below.
+Page container logic
+The content area is fluid — it fills the remaining width after the sidebar. No max-width cap on the content area container itself. Individual content zones within a page (forms, detail panels, chart cards) may have internal width constraints to preserve readability. Page content starts with a consistent top padding below the Topbar. Left and right padding within the content area is consistent across all pages — defined once at the container level, never overridden per-component.
+Page header pattern
+Sits immediately below the Topbar, within the scrollable content area. Contains: page title (can duplicate or expand on the Topbar title), optional subtitle, and a right-aligned action zone (primary button, secondary button). This is distinct from the Topbar — the Topbar is fixed chrome, the Page Header scrolls with the page. On short pages (Settings, AI Helpers) the Page Header may be minimal or absent.
+Action button placement
+Primary action: always right-aligned in the Page Header. One per page maximum. Secondary actions: also in the Page Header, left of the primary button, using outlined or ghost button style. Bulk/contextual actions: in the Selection Toolbar (appears above the table when rows are selected, replaces the Filter Bar). Inline row actions: in a DropdownMenu (three-dot or labeled) in the rightmost table column. Destructive actions: always separated and always confirmation-gated.
+Filter placement
+Page-level global filters (date range): in the Topbar, right of center, on analytics pages only. Section-level filters (for tables and data surfaces): in a Filter Bar component that sits directly above the data it controls, below the Tab Bar if one exists. Never in the sidebar. Never inside a card header. Never floating. One Filter Bar per data surface — if a page has two data tables, each has its own filter controls in its section.
+Insight and recommendation placement
+Insights live in one of two places only: a collapsible right-side Insight Panel (Dashboard, Trends) or a dedicated content section within a specific tab (AI Helpers). Insights never appear inline in table rows, inside card headers, or injected into the Topbar. They are always dismissible. The Insight Panel collapses to a narrow indicator strip when closed — it does not disappear entirely, giving users a way to reopen it.
+
+Tab Priority Notes
+TabPrimary CharacterDashboardAnalytics-heavy + Insight-heavyPlaylistsTable-heavyCurationTable-heavy + Workflow-heavyTrendsAnalytics-heavy + Insight-heavyTradesTable-heavy + Workflow-heavyReleasesTable-heavySyncTable-heavy + Workflow-heavyAI HelpersInsight-heavyAuth / SettingsForm-heavy
+
+MVP Layout Recommendation
+Design these first, with maximum depth:
+1. Playlists tab — It is the operational heart of the product. The team will live in this tab. The table, filter bar, stat cards, and record drawer must be pixel-perfect and fully specified before anything else is built. Every other table-heavy tab (Trades, Releases, Sync, Curation) inherits its patterns from this one.
+2. Dashboard tab — It is the first screen users see and the one that communicates product value most immediately. If the Dashboard feels shallow or unfinished, the whole product feels unfinished. The stat cards, growth chart, and insight panel must work well together.
+3. Curation tab — It has the most complex workflow logic of any table-heavy tab. The three-tab view (Pending / Approved / Rejected), inline approve/reject actions, and drawer-based review make it the most interaction-dense page. Getting this right defines the workflow component patterns for Trades and Sync.
+Design these second, with standard depth:
+Trends (analytics pattern is similar to Dashboard but more chart-dense), Sync (inherits from Playlists table + adds error-state design work), Trades (inherits from Playlists table + adds trade relationship modeling in the drawer).
+Design these last, with minimal depth for MVP:
+Releases (straightforward table pattern, lower operational urgency at launch), AI Helpers (functional at MVP with a simple insight card list — the Q&A interface can be a V2 feature), Auth / Settings (build the Integrations section first since Spotify connection is required for any data; all other settings sections are non-blocking for MVP).

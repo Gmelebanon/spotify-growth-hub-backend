@@ -1,0 +1,57 @@
+BEGIN;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS spotify_id VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS description TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS image_url VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS owner_name VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS followers INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS tracks_count INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS spotify_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS external_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS playlist_url TEXT;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS external_id VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS playlist_spotify_id VARCHAR;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS total_tracks INTEGER;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS track_count INTEGER;
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
+
+ALTER TABLE playlists
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS ix_playlists_account_id
+ON playlists (account_id);
+
+CREATE INDEX IF NOT EXISTS ix_playlists_spotify_id
+ON playlists (spotify_id);
+
+COMMIT;
