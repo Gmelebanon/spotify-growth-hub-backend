@@ -17,7 +17,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://nerd-engine.vercel.app",  # ✅ your live frontend
+        "https://nerd-engine.vercel.app",
+        "https://nerd-engine-git-main-wissammantoufeh-5383s-projects.vercel.app",
+        "https://nerd-engine-96ldpmfe2-wissammantoufeh-5383s-projects.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
