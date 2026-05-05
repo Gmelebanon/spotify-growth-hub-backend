@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import List
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,9 +11,42 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.follower_history import FollowerHistory
 from app.models.playlist import Playlist
+from app.models.ads_meta import AdsMeta
 from app.models.spotify_account import SpotifyAccount
 
 router = APIRouter(tags=["playlists"])
+
+
+class UpdateAdsMetaRequest(BaseModel):
+    category: str | None = None
+    genre: str | None = None
+    country: str | None = None
+    master_playlist: str | None = None
+    ads: list | None = None
+    color: str | None = None
+
+class UpdatePlaylistGenreRequest(BaseModel):
+    genre: str | None = None
+
+def serialize_ads_meta(meta: AdsMeta | None):
+    if not meta:
+        return {
+            "category": None,
+            "genre": None,
+            "country": None,
+            "master_playlist": None,
+            "ads": [],
+            "color": None,
+        }
+
+    return {
+        "category": meta.category,
+        "genre": meta.genre,
+        "country": meta.country,
+        "master_playlist": meta.master_playlist,
+        "ads": meta.ads or [],
+        "color": meta.color,
+    }
 
 
 def get_account_or_404(db: Session, account_id: int):
@@ -157,10 +190,53 @@ def compute_growth_stats(playlist: Playlist, history_rows):
     }
 
 
-def serialize_playlist(playlist: Playlist, history_rows=None):
+def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
+    """Return daily follower growth for today and previous days.
+
+    Uses the latest recorded followers for each date. A day needs the previous
+    day's snapshot to calculate growth. Missing data returns 0 so the frontend
+    stays stable until enough daily syncs exist.
+    """
+    current_followers = getattr(playlist, "followers", 0) or 0
+    by_date = {}
+
+    for row in history_rows or []:
+        if not row.created_at:
+            continue
+        day_key = row.created_at.date().isoformat()
+        existing = by_date.get(day_key)
+        if existing is None or row.created_at > existing.created_at:
+            by_date[day_key] = row
+
+    today = datetime.utcnow().date()
+    today_key = today.isoformat()
+    if today_key not in by_date:
+        by_date[today_key] = type("Snapshot", (), {"followers": current_followers, "created_at": datetime.utcnow()})()
+
+    values = []
+    for offset in range(days):
+        day = today - timedelta(days=offset)
+        prev_day = day - timedelta(days=1)
+        row = by_date.get(day.isoformat())
+        prev_row = by_date.get(prev_day.isoformat())
+        if row is None or prev_row is None:
+            growth_value = 0
+        else:
+            growth_value = (row.followers or 0) - (prev_row.followers or 0)
+        values.append({
+            "date": day.isoformat(),
+            "label": f"{day.day}/{day.month}",
+            "growth": growth_value,
+        })
+
+    return values
+
+
+def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta | None = None):
     spotify_id = getattr(playlist, "spotify_id", None)
     history_rows = history_rows or []
     growth = compute_growth_stats(playlist, history_rows)
+    daily_growth = compute_daily_growth_stats(playlist, history_rows, 30)
 
     tracks_count = (
         getattr(playlist, "tracks_count", 0)
@@ -181,6 +257,14 @@ def serialize_playlist(playlist: Playlist, history_rows=None):
         "growth_24h": growth["growth_24h"],
         "growth_7d": growth["growth_7d"],
         "growth_30d": growth["growth_30d"],
+        "daily_growth": daily_growth,
+        "today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
+        "today_growth": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
+        "growth_today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
+        "today_minus_1": daily_growth[1]["growth"] if len(daily_growth) > 1 else 0,
+        "today_minus_2": daily_growth[2]["growth"] if len(daily_growth) > 2 else 0,
+        "today_minus_3": daily_growth[3]["growth"] if len(daily_growth) > 3 else 0,
+        "today_minus_4": daily_growth[4]["growth"] if len(daily_growth) > 4 else 0,
         "tracks_count": tracks_count,
         "tracks_total": tracks_count,
         "total_tracks": tracks_count,
@@ -194,6 +278,7 @@ def serialize_playlist(playlist: Playlist, history_rows=None):
         "created_at": playlist.created_at.isoformat()
         if getattr(playlist, "created_at", None)
         else None,
+        "ads_meta": serialize_ads_meta(ads_meta),
     }
 
 
@@ -388,7 +473,24 @@ def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
-    items = [serialize_playlist(playlist, get_history_rows(db, playlist.id)) for playlist in playlists]
+    playlist_ids = [playlist.id for playlist in playlists]
+    meta_rows = (
+        db.query(AdsMeta)
+        .filter(AdsMeta.playlist_id.in_(playlist_ids))
+        .all()
+        if playlist_ids
+        else []
+    )
+    meta_by_playlist_id = {meta.playlist_id: meta for meta in meta_rows}
+
+    items = [
+        serialize_playlist(
+            playlist,
+            get_history_rows(db, playlist.id),
+            meta_by_playlist_id.get(playlist.id),
+        )
+        for playlist in playlists
+    ]
     return {"items": items, "playlists": items}
 
 
@@ -401,7 +503,8 @@ def get_playlists_legacy(account_id: int, db: Session = Depends(get_db)):
 def get_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(get_db)):
     playlist = get_playlist_or_404(db, account_id, playlist_id)
     history_rows = get_history_rows(db, playlist.id)
-    return serialize_playlist(playlist, history_rows)
+    ads_meta = db.query(AdsMeta).filter(AdsMeta.playlist_id == playlist.id).first()
+    return serialize_playlist(playlist, history_rows, ads_meta)
 
 
 @router.post("/api/accounts/{account_id}/playlists/sync")
@@ -422,12 +525,27 @@ def sync_account_playlists_api(
         .all()
     )
 
+    playlist_ids = [playlist.id for playlist in playlists]
+    meta_rows = (
+        db.query(AdsMeta).filter(AdsMeta.playlist_id.in_(playlist_ids)).all()
+        if playlist_ids
+        else []
+    )
+    meta_by_playlist_id = {meta.playlist_id: meta for meta in meta_rows}
+
     return {
         "message": "Spotify playlists refreshed",
         "imported": result["imported"],
         "updated": result["updated"],
         "total": result["total"],
-        "items": [serialize_playlist(playlist, get_history_rows(db, playlist.id)) for playlist in playlists],
+        "items": [
+            serialize_playlist(
+                playlist,
+                get_history_rows(db, playlist.id),
+                meta_by_playlist_id.get(playlist.id),
+            )
+            for playlist in playlists
+        ],
     }
 
 @router.post("/accounts/{account_id}/playlists/sync")
@@ -689,9 +807,37 @@ def replace_playlist_tracks_legacy(
 ):
     return replace_playlist_tracks_logic(account_id, playlist_id, payload, db)
 
-class UpdatePlaylistGenreRequest(BaseModel):
-    genre: str | None = None
 
+@router.post("/api/playlists/sync-all")
+def sync_all_playlists_api(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    account_ids = [
+        account.id
+        for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
+    ]
+
+    def run_sync_for_accounts(ids: list[int]):
+        db_session = next(get_db())
+
+        try:
+            for account_id in ids:
+                try:
+                    refresh_account_playlists_from_spotify(db_session, account_id)
+                    print(f"Synced account {account_id}")
+                except Exception as e:
+                    print(f"Sync failed for account {account_id}: {e}")
+        finally:
+            db_session.close()
+
+    background_tasks.add_task(run_sync_for_accounts, account_ids)
+
+    return {
+        "message": "Sync started",
+        "accounts": account_ids,
+    }
+    
 
 @router.patch("/api/playlists/{playlist_id}/genre")
 def update_playlist_genre(
@@ -715,4 +861,54 @@ def update_playlist_genre(
         "message": "Genre updated",
         "playlist_id": playlist.id,
         "genre": playlist.genre,
+    }
+
+@router.get("/api/playlists/{playlist_id}/ads-meta")
+def get_ads_meta(playlist_id: int, db: Session = Depends(get_db)):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    meta = db.query(AdsMeta).filter(AdsMeta.playlist_id == playlist_id).first()
+    return {"playlist_id": playlist_id, "ads_meta": serialize_ads_meta(meta)}
+
+
+@router.patch("/api/playlists/{playlist_id}/ads-meta")
+def update_ads_meta(
+    playlist_id: int,
+    payload: UpdateAdsMetaRequest,
+    db: Session = Depends(get_db),
+):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    meta = db.query(AdsMeta).filter(AdsMeta.playlist_id == playlist_id).first()
+
+    if not meta:
+        meta = AdsMeta(playlist_id=playlist_id)
+
+    if payload.category is not None:
+        meta.category = payload.category
+    if payload.genre is not None:
+        meta.genre = payload.genre
+    if payload.country is not None:
+        meta.country = payload.country
+    if payload.master_playlist is not None:
+        meta.master_playlist = payload.master_playlist
+    if payload.ads is not None:
+        meta.ads = payload.ads
+    if payload.color is not None:
+        meta.color = payload.color
+
+    db.add(meta)
+    db.commit()
+    db.refresh(meta)
+
+    return {
+        "message": "Saved",
+        "playlist_id": playlist_id,
+        "ads_meta": serialize_ads_meta(meta),
     }
