@@ -1,0 +1,14 @@
+name: Daily Spotify Sync
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 10 AM Beirut
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call sync endpoint
+        run: |
+          curl -X POST https://spotify-growth-hub-backend.onrender.com/api/playlists/sync-all
