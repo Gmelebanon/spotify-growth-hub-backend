@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta
 from typing import List
 
@@ -25,8 +26,6 @@ class UpdateAdsMetaRequest(BaseModel):
     ads: list | None = None
     color: str | None = None
 
-class UpdatePlaylistGenreRequest(BaseModel):
-    genre: str | None = None
 
 def serialize_ads_meta(meta: AdsMeta | None):
     if not meta:
@@ -809,10 +808,7 @@ def replace_playlist_tracks_legacy(
 
 
 @router.post("/api/playlists/sync-all")
-def sync_all_playlists_api(
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
+def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     account_ids = [
         account.id
         for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
@@ -820,24 +816,217 @@ def sync_all_playlists_api(
 
     def run_sync_for_accounts(ids: list[int]):
         db_session = next(get_db())
-
         try:
             for account_id in ids:
                 try:
                     refresh_account_playlists_from_spotify(db_session, account_id)
                     print(f"Synced account {account_id}")
-                except Exception as e:
-                    print(f"Sync failed for account {account_id}: {e}")
+                except Exception as exc:
+                    print(f"Sync failed for account {account_id}: {exc}")
         finally:
             db_session.close()
 
     background_tasks.add_task(run_sync_for_accounts, account_ids)
 
+    return {"message": "Sync started", "accounts": account_ids}
+
+
+class CreatePlaylistRequest(BaseModel):
+    account_id: int
+    name: str
+    description: str | None = None
+    import_tracks_url: str | None = None
+    import_tracks_urls: list[str] | None = None
+
+
+class BulkCreatePlaylistRow(BaseModel):
+    account_id: int
+    name: str
+    description: str | None = None
+    import_tracks_url: str | None = None
+    import_tracks_urls: list[str] | None = None
+
+
+class BulkCreatePlaylistsRequest(BaseModel):
+    rows: list[BulkCreatePlaylistRow]
+
+
+def extract_spotify_playlist_id(value: str | None):
+    if not value:
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"open\.spotify\.com/playlist/([A-Za-z0-9]+)",
+        r"spotify:playlist:([A-Za-z0-9]+)",
+        r"playlist/([A-Za-z0-9]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+
+    if re.fullmatch(r"[A-Za-z0-9]{16,}", text):
+        return text
+
+    return None
+
+
+def get_spotify_user_id(db: Session, account: SpotifyAccount):
+    for field in ["spotify_user_id", "spotify_id", "user_id"]:
+        value = getattr(account, field, None)
+        if value:
+            return value
+
+    response = spotify_request(db, account, "GET", "https://api.spotify.com/v1/me")
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Spotify profile fetch failed: {response.text}",
+        )
+
+    user_id = response.json().get("id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Spotify did not return user id")
+
+    return user_id
+
+
+def collect_import_track_uris(db: Session, account: SpotifyAccount, urls: list[str]):
+    track_uris: list[str] = []
+    unresolved: list[str] = []
+
+    for url in urls:
+        source_playlist_id = extract_spotify_playlist_id(url)
+        if not source_playlist_id:
+            unresolved.append(url)
+            continue
+
+        try:
+            tracks = fetch_playlist_tracks_from_spotify(db, account, source_playlist_id)
+            for track in tracks:
+                spotify_id = track.get("spotify_id") or track.get("id")
+                if spotify_id:
+                    track_uris.append(f"spotify:track:{spotify_id}")
+        except Exception:
+            unresolved.append(url)
+
+    # Spotify allows max 100 per request, but duplicate URIs are fine to dedupe here.
+    deduped = list(dict.fromkeys(track_uris))
+    return deduped, unresolved
+
+
+def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | BulkCreatePlaylistRow):
+    account = get_account_or_404(db, payload.account_id)
+    user_id = get_spotify_user_id(db, account)
+
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Playlist name is required")
+
+    response = spotify_request(
+        db,
+        account,
+        "POST",
+        f"https://api.spotify.com/v1/users/{user_id}/playlists",
+        json={
+            "name": name,
+            "description": payload.description or "",
+            "public": False,
+        },
+        timeout=30,
+    )
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Spotify playlist creation failed: {response.text}",
+        )
+
+    spotify_playlist = response.json()
+    spotify_playlist_id = spotify_playlist.get("id")
+    spotify_url = (spotify_playlist.get("external_urls") or {}).get("spotify")
+
+    imported_urls = []
+    if payload.import_tracks_url:
+        imported_urls.append(payload.import_tracks_url)
+    if payload.import_tracks_urls:
+        imported_urls.extend(payload.import_tracks_urls)
+
+    track_uris: list[str] = []
+    unresolved_sources: list[str] = []
+    if imported_urls and spotify_playlist_id:
+        track_uris, unresolved_sources = collect_import_track_uris(db, account, imported_urls)
+        if track_uris:
+            add_tracks_to_spotify_playlist(db, account, spotify_playlist_id, track_uris)
+
+    playlist = Playlist(
+        account_id=account.id,
+        spotify_id=spotify_playlist_id,
+        spotify_playlist_id=spotify_playlist_id,
+        name=spotify_playlist.get("name") or name,
+        description=spotify_playlist.get("description") or payload.description,
+        spotify_url=spotify_url,
+        external_url=spotify_url,
+        url=spotify_url,
+        playlist_url=spotify_url,
+        tracks_count=len(track_uris),
+        tracks_total=len(track_uris),
+        followers=0,
+        updated_at=datetime.utcnow(),
+        created_at=datetime.utcnow(),
+    )
+
+    db.add(playlist)
+    db.commit()
+    db.refresh(playlist)
+
     return {
-        "message": "Sync started",
-        "accounts": account_ids,
+        "id": playlist.id,
+        "spotify_id": spotify_playlist_id,
+        "name": playlist.name,
+        "account_id": account.id,
+        "account_name": getattr(account, "display_name", None) or getattr(account, "name", None),
+        "tracks_count": len(track_uris),
+        "spotify_url": spotify_url,
+        "playlist_url": spotify_url,
+        "link": spotify_url,
+        "unresolved_sources": unresolved_sources,
     }
-    
+
+
+@router.post("/api/playlists/create")
+def create_playlist_api(payload: CreatePlaylistRequest, db: Session = Depends(get_db)):
+    return create_spotify_playlist_logic(db, payload)
+
+
+@router.post("/api/playlists/create-bulk")
+def create_playlists_bulk_api(payload: BulkCreatePlaylistsRequest, db: Session = Depends(get_db)):
+    results = []
+
+    for row in payload.rows:
+        try:
+            results.append(create_spotify_playlist_logic(db, row))
+        except Exception as exc:
+            results.append({
+                "name": row.name,
+                "account_id": row.account_id,
+                "tracks_count": 0,
+                "id": "—",
+                "link": "—",
+                "error": str(exc),
+            })
+
+    return {"items": results, "results": results}
+
+
+class UpdatePlaylistGenreRequest(BaseModel):
+    genre: str | None = None
+
 
 @router.patch("/api/playlists/{playlist_id}/genre")
 def update_playlist_genre(
@@ -912,3 +1101,8 @@ def update_ads_meta(
         "playlist_id": playlist_id,
         "ads_meta": serialize_ads_meta(meta),
     }
+
+# Compatibility alias for older frontend naming
+@router.post("/api/playlists/bulk-create")
+def create_playlists_bulk_alias_api(payload: BulkCreatePlaylistsRequest, db: Session = Depends(get_db)):
+    return create_playlists_bulk_api(payload, db)

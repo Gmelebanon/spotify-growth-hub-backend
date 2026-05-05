@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.database import Base, engine
-from app.api.routes import accounts, playlists, curation
+from app.api.routes import accounts, playlists, curation, curation_storage
 
 load_dotenv()
 
@@ -31,3 +31,4 @@ app.add_middleware(
 app.include_router(accounts.router)
 app.include_router(playlists.router)
 app.include_router(curation.router)
+app.include_router(curation_storage.router)
