@@ -230,12 +230,39 @@ def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30)
 
     return values
 
+def build_daily_history(history_rows):
+    rows = sorted(
+        [row for row in history_rows if row.created_at],
+        key=lambda row: row.created_at,
+    )
+
+    by_date = {}
+
+    for row in rows:
+        key = row.created_at.strftime("%-d/%-m") if os.name != "nt" else row.created_at.strftime("%#d/%#m")
+        by_date[key] = row.followers or 0
+
+    dates = list(by_date.keys())
+    result = []
+
+    for index, date in enumerate(dates):
+        current = by_date[date]
+        previous = by_date[dates[index - 1]] if index > 0 else current
+
+        result.append({
+            "date": date,
+            "followers": current,
+            "growth": current - previous,
+        })
+
+    return result
 
 def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta | None = None):
     spotify_id = getattr(playlist, "spotify_id", None)
     history_rows = history_rows or []
     growth = compute_growth_stats(playlist, history_rows)
     daily_growth = compute_daily_growth_stats(playlist, history_rows, 30)
+    daily_history = build_daily_history(history_rows)
 
     tracks_count = (
         getattr(playlist, "tracks_count", 0)
@@ -257,6 +284,7 @@ def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta 
         "growth_7d": growth["growth_7d"],
         "growth_30d": growth["growth_30d"],
         "daily_growth": daily_growth,
+        "daily_history": daily_history,
         "today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
         "today_growth": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
         "growth_today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
@@ -828,7 +856,8 @@ def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depe
 
     background_tasks.add_task(run_sync_for_accounts, account_ids)
 
-    return {"message": "Sync started", "accounts": account_ids}
+    # Keep cron-job.org response very small. The actual sync continues in the background.
+    return {"success": True, "message": "Sync started"}
 
 
 class CreatePlaylistRequest(BaseModel):
