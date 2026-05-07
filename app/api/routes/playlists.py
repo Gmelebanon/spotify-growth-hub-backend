@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 import requests
@@ -168,6 +169,10 @@ def closest_followers_at_or_before(history_rows, target: datetime):
     return None
 
 
+def today_utc_date():
+    return datetime.now(timezone.utc).date()
+
+
 def compute_growth_stats(playlist: Playlist, history_rows):
     now = datetime.utcnow()
     current = getattr(playlist, "followers", 0) or 0
@@ -224,35 +229,53 @@ def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30)
             growth_value = (row.followers or 0) - (prev_row.followers or 0)
         values.append({
             "date": day.isoformat(),
-            "label": f"{day.day}/{day.month}",
+            "label": f"{day.month}/{day.day}",
             "growth": growth_value,
         })
 
     return values
 
 def build_daily_history(history_rows):
-    rows = sorted(
-        [row for row in history_rows if row.created_at],
-        key=lambda row: row.created_at,
-    )
+    rows = [
+        row
+        for row in history_rows
+        if getattr(row, "created_at", None) or getattr(row, "date", None)
+    ]
 
     by_date = {}
 
     for row in rows:
-        key = row.created_at.strftime("%-d/%-m") if os.name != "nt" else row.created_at.strftime("%#d/%#m")
-        by_date[key] = row.followers or 0
+        row_date = getattr(row, "date", None)
 
-    dates = list(by_date.keys())
+        if not row_date and getattr(row, "created_at", None):
+            row_date = row.created_at.date()
+
+        if not row_date:
+            continue
+
+        key = row_date.isoformat()
+        existing = by_date.get(key)
+
+        if existing is None:
+            by_date[key] = row
+        else:
+            existing_created = getattr(existing, "created_at", None)
+            row_created = getattr(row, "created_at", None)
+
+            if row_created and existing_created and row_created > existing_created:
+                by_date[key] = row
+
+    ordered_dates = sorted(by_date.keys())
     result = []
 
-    for index, date in enumerate(dates):
-        current = by_date[date]
-        previous = by_date[dates[index - 1]] if index > 0 else current
+    for current_date in ordered_dates:
+        current_row = by_date[current_date]
+        current_value = getattr(current_row, "followers", 0) or 0
 
         result.append({
-            "date": date,
-            "followers": current,
-            "growth": current - previous,
+            "date": current_date,
+            "followers": current_value,
+            "growth": current_value,
         })
 
     return result
@@ -866,6 +889,11 @@ class CreatePlaylistRequest(BaseModel):
     description: str | None = None
     import_tracks_url: str | None = None
     import_tracks_urls: list[str] | None = None
+    source_playlist_url: str | None = None
+    source_playlist_urls: list[str] | None = None
+    copy_tracks_from_url: str | None = None
+    copy_tracks_from_urls: list[str] | None = None
+    source_playlist_ids: list[str] | None = None
 
 
 class BulkCreatePlaylistRow(BaseModel):
@@ -874,6 +902,11 @@ class BulkCreatePlaylistRow(BaseModel):
     description: str | None = None
     import_tracks_url: str | None = None
     import_tracks_urls: list[str] | None = None
+    source_playlist_url: str | None = None
+    source_playlist_urls: list[str] | None = None
+    copy_tracks_from_url: str | None = None
+    copy_tracks_from_urls: list[str] | None = None
+    source_playlist_ids: list[str] | None = None
 
 
 class BulkCreatePlaylistsRequest(BaseModel):
@@ -929,7 +962,9 @@ def collect_import_track_uris(db: Session, account: SpotifyAccount, urls: list[s
     track_uris: list[str] = []
     unresolved: list[str] = []
 
-    for url in urls:
+    cleaned_urls = [str(url).strip() for url in urls if str(url or "").strip()]
+
+    for url in cleaned_urls:
         source_playlist_id = extract_spotify_playlist_id(url)
         if not source_playlist_id:
             unresolved.append(url)
@@ -939,14 +974,43 @@ def collect_import_track_uris(db: Session, account: SpotifyAccount, urls: list[s
             tracks = fetch_playlist_tracks_from_spotify(db, account, source_playlist_id)
             for track in tracks:
                 spotify_id = track.get("spotify_id") or track.get("id")
-                if spotify_id:
+                if spotify_id and not str(spotify_id).startswith("track-"):
                     track_uris.append(f"spotify:track:{spotify_id}")
-        except Exception:
-            unresolved.append(url)
+        except Exception as exc:
+            unresolved.append(f"{url} ({exc})")
 
-    # Spotify allows max 100 per request, but duplicate URIs are fine to dedupe here.
+    # Spotify allows max 100 per add request; add_tracks_to_spotify_playlist chunks them.
     deduped = list(dict.fromkeys(track_uris))
     return deduped, unresolved
+
+
+def get_import_urls_from_payload(payload: CreatePlaylistRequest | BulkCreatePlaylistRow) -> list[str]:
+    urls: list[str] = []
+
+    single_fields = [
+        "import_tracks_url",
+        "source_playlist_url",
+        "copy_tracks_from_url",
+    ]
+    list_fields = [
+        "import_tracks_urls",
+        "source_playlist_urls",
+        "copy_tracks_from_urls",
+        "source_playlist_ids",
+    ]
+
+    for field in single_fields:
+        value = getattr(payload, field, None)
+        if value:
+            urls.append(str(value).strip())
+
+    for field in list_fields:
+        values = getattr(payload, field, None) or []
+        for value in values:
+            if value:
+                urls.append(str(value).strip())
+
+    return list(dict.fromkeys([url for url in urls if url]))
 
 
 def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | BulkCreatePlaylistRow):
@@ -980,11 +1044,7 @@ def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | 
     spotify_playlist_id = spotify_playlist.get("id")
     spotify_url = (spotify_playlist.get("external_urls") or {}).get("spotify")
 
-    imported_urls = []
-    if payload.import_tracks_url:
-        imported_urls.append(payload.import_tracks_url)
-    if payload.import_tracks_urls:
-        imported_urls.extend(payload.import_tracks_urls)
+    imported_urls = get_import_urls_from_payload(payload)
 
     track_uris: list[str] = []
     unresolved_sources: list[str] = []
@@ -1021,9 +1081,13 @@ def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | 
         "account_id": account.id,
         "account_name": getattr(account, "display_name", None) or getattr(account, "name", None),
         "tracks_count": len(track_uris),
+        "tracks_total": len(track_uris),
+        "total_tracks": len(track_uris),
         "spotify_url": spotify_url,
         "playlist_url": spotify_url,
         "link": spotify_url,
+        "imported_urls": imported_urls,
+        "source_playlist_urls": imported_urls,
         "unresolved_sources": unresolved_sources,
     }
 
@@ -1037,7 +1101,7 @@ def create_playlist_api(payload: CreatePlaylistRequest, db: Session = Depends(ge
 def create_playlists_bulk_api(payload: BulkCreatePlaylistsRequest, db: Session = Depends(get_db)):
     results = []
 
-    for row in payload.rows:
+    for index, row in enumerate(payload.rows):
         try:
             results.append(create_spotify_playlist_logic(db, row))
         except Exception as exc:
@@ -1045,10 +1109,16 @@ def create_playlists_bulk_api(payload: BulkCreatePlaylistsRequest, db: Session =
                 "name": row.name,
                 "account_id": row.account_id,
                 "tracks_count": 0,
+                "tracks_total": 0,
+                "total_tracks": 0,
                 "id": "—",
                 "link": "—",
                 "error": str(exc),
             })
+
+        # Space out Spotify create/copy actions to reduce 429/rate-limit risk.
+        if index < len(payload.rows) - 1:
+            time.sleep(10)
 
     return {"items": results, "results": results}
 

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import HTTPException
@@ -263,62 +263,71 @@ def sync_followers_history_for_account(db: Session, account_id: int) -> dict:
             "message": "No playlists found for this account.",
             "account_id": account_id,
             "synced": 0,
+            "created_history_rows": 0,
+            "updated_history_rows": 0,
             "results": [],
         }
 
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     synced = 0
     created_history_rows = 0
+    updated_history_rows = 0
     updated_playlists = 0
     results = []
 
     for playlist in playlists:
-        details = fetch_spotify_playlist_details(
-            db=db,
-            account_id=account_id,
-            spotify_playlist_id=playlist.spotify_playlist_id,
-        )
-
-        followers_obj = details.get("followers") or {}
-        tracks_obj = details.get("tracks") or {}
-
-        latest_followers = followers_obj.get("total", 0)
-        latest_tracks_total = tracks_obj.get("total", 0)
-
-        playlist.followers = latest_followers
-        playlist.tracks_total = latest_tracks_total
-        updated_playlists += 1
-
-        existing_history = (
-            db.query(FollowerHistory)
-            .filter(
-                FollowerHistory.playlist_id == playlist.id,
-                FollowerHistory.date == today,
+        try:
+            details = fetch_spotify_playlist_details(
+                db=db,
+                account_id=account_id,
+                spotify_playlist_id=playlist.spotify_playlist_id,
             )
-            .first()
-        )
 
-        if existing_history is None:
-            history_row = FollowerHistory(
-                playlist_id=playlist.id,
-                date=today,
-                followers=latest_followers,
+            followers_obj = details.get("followers") or {}
+            tracks_obj = details.get("tracks") or {}
+
+            latest_followers = followers_obj.get("total", 0)
+            latest_tracks_total = tracks_obj.get("total", 0)
+
+            playlist.followers = latest_followers
+            playlist.tracks_total = latest_tracks_total
+            updated_playlists += 1
+
+            existing_history = (
+                db.query(FollowerHistory)
+                .filter(
+                    FollowerHistory.playlist_id == playlist.id,
+                    FollowerHistory.date == today,
+                )
+                .first()
             )
-            db.add(history_row)
-            created_history_rows += 1
-        else:
-            existing_history.followers = latest_followers
 
-        synced += 1
-        results.append(
-            {
-                "playlist_id": playlist.id,
-                "spotify_playlist_id": playlist.spotify_playlist_id,
-                "name": playlist.name,
-                "followers": latest_followers,
-                "tracks_total": latest_tracks_total,
-            }
-        )
+            if existing_history is None:
+                history_row = FollowerHistory(
+                    playlist_id=playlist.id,
+                    date=today,
+                    followers=latest_followers,
+                )
+                db.add(history_row)
+                created_history_rows += 1
+            else:
+                existing_history.followers = latest_followers
+                updated_history_rows += 1
+
+            synced += 1
+            results.append(
+                {
+                    "playlist_id": playlist.id,
+                    "spotify_playlist_id": playlist.spotify_playlist_id,
+                    "name": playlist.name,
+                    "followers": latest_followers,
+                    "tracks_total": latest_tracks_total,
+                    "date": str(today),
+                }
+            )
+
+        except Exception as exc:
+            print(f"Failed syncing follower history for playlist {playlist.id}: {exc}")
 
     db.commit()
 
@@ -328,9 +337,9 @@ def sync_followers_history_for_account(db: Session, account_id: int) -> dict:
         "synced": synced,
         "updated_playlists": updated_playlists,
         "created_history_rows": created_history_rows,
+        "updated_history_rows": updated_history_rows,
         "results": results,
     }
-
 
 def fetch_spotify_playlist_tracks(
     db: Session,
