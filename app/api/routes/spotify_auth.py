@@ -6,6 +6,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -42,6 +43,29 @@ SCOPES = " ".join(
 )
 
 
+def update_account_tokens(
+    account: SpotifyAccount,
+    spotify_user_id: str,
+    display_name: str,
+    email: str | None,
+    access_token: str,
+    refresh_token: str | None,
+    expires_at: datetime,
+):
+    account.spotify_user_id = spotify_user_id
+    account.display_name = display_name
+    account.email = email
+    account.access_token = access_token
+
+    if refresh_token:
+        account.refresh_token = refresh_token
+
+    account.token_expires_at = expires_at
+
+    if hasattr(account, "updated_at"):
+        account.updated_at = datetime.utcnow()
+
+
 @router.get("/login")
 def spotify_login():
     if not SPOTIFY_CLIENT_ID:
@@ -62,7 +86,11 @@ def spotify_login():
 
 
 @router.get("/callback")
-def spotify_callback(code: str | None = None, error: str | None = None, db: Session = Depends(get_db)):
+def spotify_callback(
+    code: str | None = None,
+    error: str | None = None,
+    db: Session = Depends(get_db),
+):
     if error:
         raise HTTPException(status_code=400, detail=f"Spotify authorization failed: {error}")
 
@@ -123,21 +151,35 @@ def spotify_callback(code: str | None = None, error: str | None = None, db: Sess
     email = profile.get("email")
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
+    # First match by Spotify user id.
     account = (
         db.query(SpotifyAccount)
         .filter(SpotifyAccount.spotify_user_id == spotify_user_id)
         .first()
     )
 
+    # Fallback: some old/manual rows may already exist by display name or email.
+    # This avoids duplicate-key errors and updates the existing row with tokens.
+    if not account and email:
+        account = db.query(SpotifyAccount).filter(SpotifyAccount.email == email).first()
+
+    if not account and display_name:
+        account = (
+            db.query(SpotifyAccount)
+            .filter(SpotifyAccount.display_name == display_name)
+            .first()
+        )
+
     if account:
-        account.display_name = display_name
-        account.email = email
-        account.access_token = access_token
-        if refresh_token:
-            account.refresh_token = refresh_token
-        account.token_expires_at = expires_at
-        if hasattr(account, "updated_at"):
-            account.updated_at = datetime.utcnow()
+        update_account_tokens(
+            account=account,
+            spotify_user_id=spotify_user_id,
+            display_name=display_name,
+            email=email,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
+        )
     else:
         account = SpotifyAccount(
             spotify_user_id=spotify_user_id,
@@ -149,7 +191,47 @@ def spotify_callback(code: str | None = None, error: str | None = None, db: Sess
         )
         db.add(account)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+        # Last safety fallback for duplicate rows/race conditions.
+        account = (
+            db.query(SpotifyAccount)
+            .filter(SpotifyAccount.spotify_user_id == spotify_user_id)
+            .first()
+        )
+
+        if not account and email:
+            account = db.query(SpotifyAccount).filter(SpotifyAccount.email == email).first()
+
+        if not account and display_name:
+            account = (
+                db.query(SpotifyAccount)
+                .filter(SpotifyAccount.display_name == display_name)
+                .first()
+            )
+
+        if not account:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not save Spotify account because of a database duplicate conflict.",
+            )
+
+        update_account_tokens(
+            account=account,
+            spotify_user_id=spotify_user_id,
+            display_name=display_name,
+            email=email,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
+        )
+
+        db.add(account)
+        db.commit()
+
     db.refresh(account)
 
     return RedirectResponse(
