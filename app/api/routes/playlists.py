@@ -378,6 +378,51 @@ def fetch_spotify_playlist_detail(db: Session, account: SpotifyAccount, spotify_
     return response.json()
 
 
+@router.get("/api/spotify/playlists/{spotify_playlist_id}/metadata")
+def get_spotify_playlist_metadata(
+    spotify_playlist_id: str,
+    account_id: int,
+    db: Session = Depends(get_db),
+):
+    account = get_account_or_404(db, account_id)
+
+    response = spotify_request(
+        db,
+        account,
+        "GET",
+        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}",
+        params={
+            "fields": "id,name,description,images,external_urls,owner.display_name,tracks.total"
+        },
+        timeout=30,
+    )
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Spotify playlist metadata fetch failed: {response.text}",
+        )
+
+    detail = response.json()
+    images = detail.get("images") or []
+    external_urls = detail.get("external_urls") or {}
+    owner = detail.get("owner") or {}
+    tracks = detail.get("tracks") or {}
+
+    return {
+        "spotify_id": detail.get("id"),
+        "spotify_playlist_id": detail.get("id"),
+        "name": detail.get("name"),
+        "description": detail.get("description"),
+        "image_url": images[0].get("url") if images else None,
+        "spotify_url": external_urls.get("spotify"),
+        "owner_name": owner.get("display_name"),
+        "tracks_count": tracks.get("total") or 0,
+        "tracks_total": tracks.get("total") or 0,
+        "total_tracks": tracks.get("total") or 0,
+    }
+
+
 def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: dict | None = None):
     source = detail or item
 
