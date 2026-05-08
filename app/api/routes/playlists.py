@@ -1,7 +1,6 @@
 import os
 import re
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import List
 
 import requests
@@ -378,51 +377,6 @@ def fetch_spotify_playlist_detail(db: Session, account: SpotifyAccount, spotify_
     return response.json()
 
 
-@router.get("/api/spotify/playlists/{spotify_playlist_id}/metadata")
-def get_spotify_playlist_metadata(
-    spotify_playlist_id: str,
-    account_id: int,
-    db: Session = Depends(get_db),
-):
-    account = get_account_or_404(db, account_id)
-
-    response = spotify_request(
-        db,
-        account,
-        "GET",
-        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}",
-        params={
-            "fields": "id,name,description,images,external_urls,owner.display_name,tracks.total"
-        },
-        timeout=30,
-    )
-
-    if not response.ok:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"Spotify playlist metadata fetch failed: {response.text}",
-        )
-
-    detail = response.json()
-    images = detail.get("images") or []
-    external_urls = detail.get("external_urls") or {}
-    owner = detail.get("owner") or {}
-    tracks = detail.get("tracks") or {}
-
-    return {
-        "spotify_id": detail.get("id"),
-        "spotify_playlist_id": detail.get("id"),
-        "name": detail.get("name"),
-        "description": detail.get("description"),
-        "image_url": images[0].get("url") if images else None,
-        "spotify_url": external_urls.get("spotify"),
-        "owner_name": owner.get("display_name"),
-        "tracks_count": tracks.get("total") or 0,
-        "tracks_total": tracks.get("total") or 0,
-        "total_tracks": tracks.get("total") or 0,
-    }
-
-
 def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: dict | None = None):
     source = detail or item
 
@@ -432,6 +386,11 @@ def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: di
     external_urls = source.get("external_urls") or {}
     spotify_url = external_urls.get("spotify")
     followers = (source.get("followers") or {}).get("total")
+
+    source_spotify_id = source.get("id") or item.get("id")
+    if source_spotify_id:
+        safe_set(playlist, "spotify_id", source_spotify_id)
+        safe_set(playlist, "spotify_playlist_id", source_spotify_id)
 
     safe_set(playlist, "name", source.get("name") or item.get("name") or "Untitled Playlist")
     safe_set(playlist, "description", source.get("description") or item.get("description"))
@@ -473,6 +432,7 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             playlist = Playlist(
                 account_id=account_id,
                 spotify_id=spotify_id,
+                spotify_playlist_id=spotify_id,
                 name=item.get("name") or "Untitled Playlist",
             )
             imported += 1
@@ -934,11 +894,6 @@ class CreatePlaylistRequest(BaseModel):
     description: str | None = None
     import_tracks_url: str | None = None
     import_tracks_urls: list[str] | None = None
-    source_playlist_url: str | None = None
-    source_playlist_urls: list[str] | None = None
-    copy_tracks_from_url: str | None = None
-    copy_tracks_from_urls: list[str] | None = None
-    source_playlist_ids: list[str] | None = None
 
 
 class BulkCreatePlaylistRow(BaseModel):
@@ -947,11 +902,6 @@ class BulkCreatePlaylistRow(BaseModel):
     description: str | None = None
     import_tracks_url: str | None = None
     import_tracks_urls: list[str] | None = None
-    source_playlist_url: str | None = None
-    source_playlist_urls: list[str] | None = None
-    copy_tracks_from_url: str | None = None
-    copy_tracks_from_urls: list[str] | None = None
-    source_playlist_ids: list[str] | None = None
 
 
 class BulkCreatePlaylistsRequest(BaseModel):
@@ -1007,9 +957,7 @@ def collect_import_track_uris(db: Session, account: SpotifyAccount, urls: list[s
     track_uris: list[str] = []
     unresolved: list[str] = []
 
-    cleaned_urls = [str(url).strip() for url in urls if str(url or "").strip()]
-
-    for url in cleaned_urls:
+    for url in urls:
         source_playlist_id = extract_spotify_playlist_id(url)
         if not source_playlist_id:
             unresolved.append(url)
@@ -1019,43 +967,14 @@ def collect_import_track_uris(db: Session, account: SpotifyAccount, urls: list[s
             tracks = fetch_playlist_tracks_from_spotify(db, account, source_playlist_id)
             for track in tracks:
                 spotify_id = track.get("spotify_id") or track.get("id")
-                if spotify_id and not str(spotify_id).startswith("track-"):
+                if spotify_id:
                     track_uris.append(f"spotify:track:{spotify_id}")
-        except Exception as exc:
-            unresolved.append(f"{url} ({exc})")
+        except Exception:
+            unresolved.append(url)
 
-    # Spotify allows max 100 per add request; add_tracks_to_spotify_playlist chunks them.
+    # Spotify allows max 100 per request, but duplicate URIs are fine to dedupe here.
     deduped = list(dict.fromkeys(track_uris))
     return deduped, unresolved
-
-
-def get_import_urls_from_payload(payload: CreatePlaylistRequest | BulkCreatePlaylistRow) -> list[str]:
-    urls: list[str] = []
-
-    single_fields = [
-        "import_tracks_url",
-        "source_playlist_url",
-        "copy_tracks_from_url",
-    ]
-    list_fields = [
-        "import_tracks_urls",
-        "source_playlist_urls",
-        "copy_tracks_from_urls",
-        "source_playlist_ids",
-    ]
-
-    for field in single_fields:
-        value = getattr(payload, field, None)
-        if value:
-            urls.append(str(value).strip())
-
-    for field in list_fields:
-        values = getattr(payload, field, None) or []
-        for value in values:
-            if value:
-                urls.append(str(value).strip())
-
-    return list(dict.fromkeys([url for url in urls if url]))
 
 
 def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | BulkCreatePlaylistRow):
@@ -1089,7 +1008,11 @@ def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | 
     spotify_playlist_id = spotify_playlist.get("id")
     spotify_url = (spotify_playlist.get("external_urls") or {}).get("spotify")
 
-    imported_urls = get_import_urls_from_payload(payload)
+    imported_urls = []
+    if payload.import_tracks_url:
+        imported_urls.append(payload.import_tracks_url)
+    if payload.import_tracks_urls:
+        imported_urls.extend(payload.import_tracks_urls)
 
     track_uris: list[str] = []
     unresolved_sources: list[str] = []
@@ -1126,13 +1049,9 @@ def create_spotify_playlist_logic(db: Session, payload: CreatePlaylistRequest | 
         "account_id": account.id,
         "account_name": getattr(account, "display_name", None) or getattr(account, "name", None),
         "tracks_count": len(track_uris),
-        "tracks_total": len(track_uris),
-        "total_tracks": len(track_uris),
         "spotify_url": spotify_url,
         "playlist_url": spotify_url,
         "link": spotify_url,
-        "imported_urls": imported_urls,
-        "source_playlist_urls": imported_urls,
         "unresolved_sources": unresolved_sources,
     }
 
@@ -1146,7 +1065,7 @@ def create_playlist_api(payload: CreatePlaylistRequest, db: Session = Depends(ge
 def create_playlists_bulk_api(payload: BulkCreatePlaylistsRequest, db: Session = Depends(get_db)):
     results = []
 
-    for index, row in enumerate(payload.rows):
+    for row in payload.rows:
         try:
             results.append(create_spotify_playlist_logic(db, row))
         except Exception as exc:
@@ -1154,16 +1073,10 @@ def create_playlists_bulk_api(payload: BulkCreatePlaylistsRequest, db: Session =
                 "name": row.name,
                 "account_id": row.account_id,
                 "tracks_count": 0,
-                "tracks_total": 0,
-                "total_tracks": 0,
                 "id": "—",
                 "link": "—",
                 "error": str(exc),
             })
-
-        # Space out Spotify create/copy actions to reduce 429/rate-limit risk.
-        if index < len(payload.rows) - 1:
-            time.sleep(10)
 
     return {"items": results, "results": results}
 
