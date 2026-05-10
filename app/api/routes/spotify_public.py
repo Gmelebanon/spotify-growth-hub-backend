@@ -15,8 +15,15 @@ def get_spotify_token():
         auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
     )
 
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Spotify token failed")
+   if response.status_code != 200:
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "message": "Spotify token failed",
+            "spotify_status": response.status_code,
+            "spotify_response": response.text,
+        },
+    )
 
     return response.json()["access_token"]
 
@@ -37,10 +44,15 @@ async def get_public_playlist_tracks(playlist_id: str):
         response = requests.get(url, headers=headers)
 
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=400,
-                detail="Spotify playlist fetch failed"
-            )
+    raise HTTPException(
+        status_code=response.status_code,
+        detail={
+            "message": "Spotify playlist fetch failed",
+            "spotify_status": response.status_code,
+            "spotify_response": response.text,
+            "playlist_id": playlist_id,
+        },
+    )
 
         data = response.json()
 
