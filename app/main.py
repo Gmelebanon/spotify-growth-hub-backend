@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.routes import spotify_public
 
 from app.core.database import Base, engine
 from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
@@ -34,3 +35,4 @@ app.include_router(curation.router)
 app.include_router(curation_storage.router)
 app.include_router(playlist_manager_state.router)
 app.include_router(spotify_auth.router)
+app.include_router(spotify_public.router)
