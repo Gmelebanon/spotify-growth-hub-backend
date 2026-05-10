@@ -15,15 +15,15 @@ def get_spotify_token():
         auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
     )
 
-   if response.status_code != 200:
-    raise HTTPException(
-        status_code=500,
-        detail={
-            "message": "Spotify token failed",
-            "spotify_status": response.status_code,
-            "spotify_response": response.text,
-        },
-    )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Spotify token failed",
+                "spotify_status": response.status_code,
+                "spotify_response": response.text,
+            },
+        )
 
     return response.json()["access_token"]
 
@@ -36,6 +36,24 @@ async def get_public_playlist_tracks(playlist_id: str):
         "Authorization": f"Bearer {token}"
     }
 
+    playlist_response = requests.get(
+        f"https://api.spotify.com/v1/playlists/{playlist_id}",
+        headers=headers,
+    )
+
+    if playlist_response.status_code != 200:
+        raise HTTPException(
+            status_code=playlist_response.status_code,
+            detail={
+                "message": "Spotify playlist fetch failed",
+                "spotify_status": playlist_response.status_code,
+                "spotify_response": playlist_response.text,
+                "playlist_id": playlist_id,
+            },
+        )
+
+    playlist_data = playlist_response.json()
+
     url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100"
 
     results = []
@@ -44,15 +62,15 @@ async def get_public_playlist_tracks(playlist_id: str):
         response = requests.get(url, headers=headers)
 
         if response.status_code != 200:
-    raise HTTPException(
-        status_code=response.status_code,
-        detail={
-            "message": "Spotify playlist fetch failed",
-            "spotify_status": response.status_code,
-            "spotify_response": response.text,
-            "playlist_id": playlist_id,
-        },
-    )
+            raise HTTPException(
+                status_code=response.status_code,
+                detail={
+                    "message": "Spotify playlist tracks fetch failed",
+                    "spotify_status": response.status_code,
+                    "spotify_response": response.text,
+                    "playlist_id": playlist_id,
+                },
+            )
 
         data = response.json()
 
@@ -85,5 +103,10 @@ async def get_public_playlist_tracks(playlist_id: str):
         url = data.get("next")
 
     return {
-        "tracks": results
+        "playlist": {
+            "id": playlist_id,
+            "name": playlist_data.get("name") or "Imported Spotify Playlist",
+            "owner_name": playlist_data.get("owner", {}).get("display_name") or "Spotify",
+        },
+        "tracks": results,
     }
