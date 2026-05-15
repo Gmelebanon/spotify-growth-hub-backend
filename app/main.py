@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import spotify_public
 from app.api.routes import curation_history
+from app.api.routes import curation_csv_playlists
 
 from app.core.database import Base, engine
 from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
@@ -38,3 +39,4 @@ app.include_router(playlist_manager_state.router)
 app.include_router(spotify_auth.router)
 app.include_router(spotify_public.router)
 app.include_router(curation_history.router)
+app.include_router(curation_csv_playlists.router)
