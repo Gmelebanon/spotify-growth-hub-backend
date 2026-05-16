@@ -241,7 +241,7 @@ def build_daily_history(history_rows):
         if getattr(row, "created_at", None) or getattr(row, "date", None)
     ]
 
-    by_date = {}
+    latest_by_date = {}
 
     for row in rows:
         row_date = getattr(row, "date", None)
@@ -253,28 +253,34 @@ def build_daily_history(history_rows):
             continue
 
         key = row_date.isoformat()
-        existing = by_date.get(key)
+
+        existing = latest_by_date.get(key)
 
         if existing is None:
-            by_date[key] = row
+            latest_by_date[key] = row
         else:
             existing_created = getattr(existing, "created_at", None)
             row_created = getattr(row, "created_at", None)
 
-            if row_created and existing_created and row_created > existing_created:
-                by_date[key] = row
+            if row_created and existing_created:
+                if row_created > existing_created:
+                    latest_by_date[key] = row
 
-    ordered_dates = sorted(by_date.keys())
+    ordered_dates = sorted(latest_by_date.keys(), reverse=True)
+
     result = []
 
     for current_date in ordered_dates:
-        current_row = by_date[current_date]
-        current_value = getattr(current_row, "followers", 0) or 0
+        current_row = latest_by_date[current_date]
+
+        followers = getattr(current_row, "followers", 0) or 0
 
         result.append({
             "date": current_date,
-            "followers": current_value,
-            "growth": current_value,
+            "followers": followers,
+            "growth": followers,
+            "value": followers,
+            "count": followers,
         })
 
     return result
@@ -283,8 +289,8 @@ def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta 
     spotify_id = getattr(playlist, "spotify_id", None)
     history_rows = history_rows or []
     growth = compute_growth_stats(playlist, history_rows)
-    daily_growth = compute_daily_growth_stats(playlist, history_rows, 30)
     daily_history = build_daily_history(history_rows)
+    daily_growth = daily_history
 
     tracks_count = (
         getattr(playlist, "tracks_count", 0)
@@ -307,13 +313,13 @@ def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta 
         "growth_30d": growth["growth_30d"],
         "daily_growth": daily_growth,
         "daily_history": daily_history,
-        "today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
-        "today_growth": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
-        "growth_today": daily_growth[0]["growth"] if len(daily_growth) > 0 else 0,
-        "today_minus_1": daily_growth[1]["growth"] if len(daily_growth) > 1 else 0,
-        "today_minus_2": daily_growth[2]["growth"] if len(daily_growth) > 2 else 0,
-        "today_minus_3": daily_growth[3]["growth"] if len(daily_growth) > 3 else 0,
-        "today_minus_4": daily_growth[4]["growth"] if len(daily_growth) > 4 else 0,
+        "today": daily_history[0]["followers"] if len(daily_history) > 0 else 0,
+        "today_growth": daily_history[0]["followers"] if len(daily_history) > 0 else 0,
+        "growth_today": daily_history[0]["followers"] if len(daily_history) > 0 else 0,
+        "today_minus_1": daily_history[1]["followers"] if len(daily_history) > 1 else 0,
+        "today_minus_2": daily_history[2]["followers"] if len(daily_history) > 2 else 0,
+        "today_minus_3": daily_history[3]["followers"] if len(daily_history) > 3 else 0,
+        "today_minus_4": daily_history[4]["followers"] if len(daily_history) > 4 else 0,
         "tracks_count": tracks_count,
         "tracks_total": tracks_count,
         "total_tracks": tracks_count,
