@@ -213,8 +213,70 @@ def _history_row_date(row):
     return row_date
 
 
-def _latest_history_by_date(history_rows):
-    """Keep one history row per date, choosing the latest created_at row."""
+def _looks_like_total_snapshot(row, playlist: Playlist | None = None) -> bool:
+    """Detect rows accidentally written by Spotify sync as total followers.
+
+    The imported history stores daily stats, but older sync code inserted total
+    follower counts into follower_history. When duplicate rows exist for the
+    same date, we prefer the smaller daily stat row instead of the total snapshot.
+    """
+    if playlist is None:
+        return False
+
+    row_followers = getattr(row, "followers", 0) or 0
+    playlist_followers = getattr(playlist, "followers", 0) or 0
+
+    return playlist_followers > 0 and row_followers == playlist_followers
+
+
+def _choose_daily_history_row(current, candidate, playlist: Playlist | None = None):
+    """Choose the best row for a date.
+
+    If sync accidentally created a total-follower snapshot and the CSV import
+    also has a daily-stat row for the same date, keep the daily-stat row.
+    """
+    if current is None:
+        return candidate
+
+    current_value = getattr(current, "followers", 0) or 0
+    candidate_value = getattr(candidate, "followers", 0) or 0
+
+    current_is_total = _looks_like_total_snapshot(current, playlist)
+    candidate_is_total = _looks_like_total_snapshot(candidate, playlist)
+
+    if current_is_total and not candidate_is_total:
+        return candidate
+    if candidate_is_total and not current_is_total:
+        return current
+
+    # If both rows are the same type and have different values, prefer the
+    # smaller absolute value because imported daily stats are small deltas while
+    # bad sync rows are full follower totals.
+    if abs(candidate_value) < abs(current_value):
+        return candidate
+
+    if abs(candidate_value) > abs(current_value):
+        return current
+
+    current_created = getattr(current, "created_at", None)
+    candidate_created = getattr(candidate, "created_at", None)
+
+    if candidate_created and current_created:
+        return candidate if candidate_created > current_created else current
+
+    if candidate_created and not current_created:
+        return candidate
+
+    return current
+
+
+def _latest_history_by_date(history_rows, playlist: Playlist | None = None):
+    """Keep one daily-stat row per date.
+
+    follower_history.followers is treated as the daily stat value. This function
+    also protects against old bad rows where Spotify sync inserted full follower
+    totals into follower_history.
+    """
     latest_by_date = {}
 
     for row in history_rows or []:
@@ -223,23 +285,13 @@ def _latest_history_by_date(history_rows):
             continue
 
         key = row_date.isoformat()
-        existing = latest_by_date.get(key)
-
-        if existing is None:
-            latest_by_date[key] = row
-            continue
-
-        existing_created = getattr(existing, "created_at", None)
-        row_created = getattr(row, "created_at", None)
-
-        if row_created and existing_created:
-            if row_created > existing_created:
-                latest_by_date[key] = row
-        elif row_created and not existing_created:
-            latest_by_date[key] = row
+        latest_by_date[key] = _choose_daily_history_row(
+            latest_by_date.get(key),
+            row,
+            playlist,
+        )
 
     return latest_by_date
-
 
 def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
     """Return daily playlist stats for today and previous days.
@@ -248,7 +300,7 @@ def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30)
     follower_history.followers. So the table should display that value directly
     instead of calculating: today followers - previous day followers.
     """
-    by_date = _latest_history_by_date(history_rows)
+    by_date = _latest_history_by_date(history_rows, playlist)
     today = datetime.utcnow().date()
 
     values = []
@@ -447,17 +499,10 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
         db.add(playlist)
         db.flush()
 
-        try:
-            history = FollowerHistory(
-                playlist_id=playlist.id,
-                followers=getattr(playlist, "followers", 0) or 0,
-                created_at=now,
-            )
-            db.add(history)
-            db.flush()
-        except Exception:
-            db.rollback()
-            db.begin()
+        # Do not write Spotify total followers into follower_history here.
+        # follower_history.followers is used by the dashboard as the imported
+        # daily stat value, so adding total followers here makes today's column
+        # show +2148 / +855 instead of the daily number.
 
     db.commit()
 
@@ -691,20 +736,12 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
         if detail:
             update_playlist_from_spotify_item(playlist, detail, detail)
 
-    now = datetime.utcnow()
-    history = FollowerHistory(
-        playlist_id=playlist.id,
-        followers=getattr(playlist, "followers", 0) or 0,
-        created_at=now,
-    )
-
     try:
         db.add(playlist)
-        db.add(history)
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Failed to sync playlist history")
+        raise HTTPException(status_code=400, detail="Failed to sync playlist")
 
     db.refresh(playlist)
     return {"message": "Playlist synced", "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id))}
