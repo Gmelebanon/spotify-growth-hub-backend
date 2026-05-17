@@ -161,6 +161,72 @@ def get_history_rows(db: Session, playlist_id: int, limit: int | None = None):
     return query.all()
 
 
+def normalize_history_match_name(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def get_related_playlist_ids_for_history(db: Session, playlist: Playlist) -> list[int]:
+    """Return duplicate/related playlist row IDs that may own imported history.
+
+    Older imports were mapped to old duplicate playlist row IDs. The visible row
+    may be a newer duplicate with the same Spotify ID/name. For daily stats, we
+    merge history across all matching rows so the UI does not fall back to total
+    followers from the visible playlist row.
+    """
+    account_id = getattr(playlist, "account_id", None)
+    playlist_id = getattr(playlist, "id", None)
+    spotify_ids = {
+        value
+        for value in [
+            getattr(playlist, "spotify_id", None),
+            getattr(playlist, "spotify_playlist_id", None),
+        ]
+        if value
+    }
+    normalized_name = normalize_history_match_name(getattr(playlist, "name", None))
+
+    related_ids = {playlist_id} if playlist_id is not None else set()
+
+    candidates = db.query(Playlist).filter(Playlist.account_id == account_id).all()
+    for candidate in candidates:
+        candidate_id = getattr(candidate, "id", None)
+        if candidate_id is None:
+            continue
+
+        candidate_spotify_ids = {
+            value
+            for value in [
+                getattr(candidate, "spotify_id", None),
+                getattr(candidate, "spotify_playlist_id", None),
+            ]
+            if value
+        }
+
+        if spotify_ids and candidate_spotify_ids and spotify_ids.intersection(candidate_spotify_ids):
+            related_ids.add(candidate_id)
+            continue
+
+        if normalized_name and normalize_history_match_name(getattr(candidate, "name", None)) == normalized_name:
+            related_ids.add(candidate_id)
+
+    return sorted(related_ids)
+
+
+def get_history_rows_for_playlist(db: Session, playlist: Playlist, limit: int | None = None):
+    playlist_ids = get_related_playlist_ids_for_history(db, playlist)
+
+    query = (
+        db.query(FollowerHistory)
+        .filter(FollowerHistory.playlist_id.in_(playlist_ids))
+        .order_by(FollowerHistory.created_at.desc())
+    )
+
+    if limit:
+        query = query.limit(limit)
+
+    return query.all()
+
+
 def closest_followers_at_or_before(history_rows, target: datetime):
     for row in history_rows:
         if row.created_at and row.created_at <= target:
@@ -213,70 +279,8 @@ def _history_row_date(row):
     return row_date
 
 
-def _looks_like_total_snapshot(row, playlist: Playlist | None = None) -> bool:
-    """Detect rows accidentally written by Spotify sync as total followers.
-
-    The imported history stores daily stats, but older sync code inserted total
-    follower counts into follower_history. When duplicate rows exist for the
-    same date, we prefer the smaller daily stat row instead of the total snapshot.
-    """
-    if playlist is None:
-        return False
-
-    row_followers = getattr(row, "followers", 0) or 0
-    playlist_followers = getattr(playlist, "followers", 0) or 0
-
-    return playlist_followers > 0 and row_followers == playlist_followers
-
-
-def _choose_daily_history_row(current, candidate, playlist: Playlist | None = None):
-    """Choose the best row for a date.
-
-    If sync accidentally created a total-follower snapshot and the CSV import
-    also has a daily-stat row for the same date, keep the daily-stat row.
-    """
-    if current is None:
-        return candidate
-
-    current_value = getattr(current, "followers", 0) or 0
-    candidate_value = getattr(candidate, "followers", 0) or 0
-
-    current_is_total = _looks_like_total_snapshot(current, playlist)
-    candidate_is_total = _looks_like_total_snapshot(candidate, playlist)
-
-    if current_is_total and not candidate_is_total:
-        return candidate
-    if candidate_is_total and not current_is_total:
-        return current
-
-    # If both rows are the same type and have different values, prefer the
-    # smaller absolute value because imported daily stats are small deltas while
-    # bad sync rows are full follower totals.
-    if abs(candidate_value) < abs(current_value):
-        return candidate
-
-    if abs(candidate_value) > abs(current_value):
-        return current
-
-    current_created = getattr(current, "created_at", None)
-    candidate_created = getattr(candidate, "created_at", None)
-
-    if candidate_created and current_created:
-        return candidate if candidate_created > current_created else current
-
-    if candidate_created and not current_created:
-        return candidate
-
-    return current
-
-
-def _latest_history_by_date(history_rows, playlist: Playlist | None = None):
-    """Keep one daily-stat row per date.
-
-    follower_history.followers is treated as the daily stat value. This function
-    also protects against old bad rows where Spotify sync inserted full follower
-    totals into follower_history.
-    """
+def _latest_history_by_date(history_rows):
+    """Keep one history row per date, choosing the latest created_at row."""
     latest_by_date = {}
 
     for row in history_rows or []:
@@ -285,13 +289,23 @@ def _latest_history_by_date(history_rows, playlist: Playlist | None = None):
             continue
 
         key = row_date.isoformat()
-        latest_by_date[key] = _choose_daily_history_row(
-            latest_by_date.get(key),
-            row,
-            playlist,
-        )
+        existing = latest_by_date.get(key)
+
+        if existing is None:
+            latest_by_date[key] = row
+            continue
+
+        existing_created = getattr(existing, "created_at", None)
+        row_created = getattr(row, "created_at", None)
+
+        if row_created and existing_created:
+            if row_created > existing_created:
+                latest_by_date[key] = row
+        elif row_created and not existing_created:
+            latest_by_date[key] = row
 
     return latest_by_date
+
 
 def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
     """Return daily playlist stats for today and previous days.
@@ -300,7 +314,7 @@ def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30)
     follower_history.followers. So the table should display that value directly
     instead of calculating: today followers - previous day followers.
     """
-    by_date = _latest_history_by_date(history_rows, playlist)
+    by_date = _latest_history_by_date(history_rows)
     today = datetime.utcnow().date()
 
     values = []
@@ -499,10 +513,9 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
         db.add(playlist)
         db.flush()
 
-        # Do not write Spotify total followers into follower_history here.
-        # follower_history.followers is used by the dashboard as the imported
-        # daily stat value, so adding total followers here makes today's column
-        # show +2148 / +855 instead of the daily number.
+        # Do not write Spotify total followers into follower_history.
+        # follower_history.followers is used by the UI as the daily stat value,
+        # and imported Excel/CSV rows should be the source of truth.
 
     db.commit()
 
@@ -590,7 +603,7 @@ def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
     items = [
         serialize_playlist(
             playlist,
-            get_history_rows(db, playlist.id),
+            get_history_rows_for_playlist(db, playlist),
             meta_by_playlist_id.get(playlist.id),
         )
         for playlist in playlists
@@ -606,7 +619,7 @@ def get_playlists_legacy(account_id: int, db: Session = Depends(get_db)):
 @router.get("/api/accounts/{account_id}/playlists/{playlist_id}")
 def get_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(get_db)):
     playlist = get_playlist_or_404(db, account_id, playlist_id)
-    history_rows = get_history_rows(db, playlist.id)
+    history_rows = get_history_rows_for_playlist(db, playlist)
     ads_meta = db.query(AdsMeta).filter(AdsMeta.playlist_id == playlist.id).first()
     return serialize_playlist(playlist, history_rows, ads_meta)
 
@@ -645,7 +658,7 @@ def sync_account_playlists_api(
         "items": [
             serialize_playlist(
                 playlist,
-                get_history_rows(db, playlist.id),
+                get_history_rows_for_playlist(db, playlist),
                 meta_by_playlist_id.get(playlist.id),
             )
             for playlist in playlists
@@ -669,7 +682,7 @@ def get_playlist_legacy(account_id: int, playlist_id: int, db: Session = Depends
 @router.get("/api/accounts/{account_id}/playlists/{playlist_id}/history")
 def get_playlist_history_api(account_id: int, playlist_id: int, db: Session = Depends(get_db)):
     playlist = get_playlist_or_404(db, account_id, playlist_id)
-    history_rows = get_history_rows(db, playlist.id, limit=60)
+    history_rows = get_history_rows_for_playlist(db, playlist, limit=60)
 
     items = [
         {
@@ -677,7 +690,7 @@ def get_playlist_history_api(account_id: int, playlist_id: int, db: Session = De
             "playlist_id": row.playlist_id,
             "followers": row.followers or 0,
             "created_at": row.created_at.isoformat() if row.created_at else None,
-            "date": row.created_at.isoformat() if row.created_at else None,
+            "date": row.date.isoformat() if getattr(row, "date", None) else (row.created_at.date().isoformat() if row.created_at else None),
         }
         for row in history_rows
     ]
@@ -715,7 +728,7 @@ def get_playlist_tracks_api(account_id: int, playlist_id: int, db: Session = Dep
     db.refresh(playlist)
 
     return {
-        "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id)),
+        "playlist": serialize_playlist(playlist, get_history_rows_for_playlist(db, playlist)),
         "items": tracks,
         "tracks": tracks,
     }
@@ -744,7 +757,7 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
         raise HTTPException(status_code=400, detail="Failed to sync playlist")
 
     db.refresh(playlist)
-    return {"message": "Playlist synced", "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id))}
+    return {"message": "Playlist synced", "playlist": serialize_playlist(playlist, get_history_rows_for_playlist(db, playlist))}
 
 
 @router.post("/accounts/{account_id}/playlists/{playlist_id}/sync")
@@ -878,7 +891,7 @@ def replace_playlist_tracks_logic(account_id: int, playlist_id: int, payload: Re
 
     return {
         "message": "Playlist cleared and replaced successfully",
-        "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id)),
+        "playlist": serialize_playlist(playlist, get_history_rows_for_playlist(db, playlist)),
         "synced_tracks": len(track_uris),
         "unresolved_tracks": unresolved,
     }
