@@ -6,6 +6,7 @@ from typing import List
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -69,6 +70,48 @@ def get_playlist_or_404(db: Session, account_id: int, playlist_id: int):
 def safe_set(model, field: str, value):
     if hasattr(model, field):
         setattr(model, field, value)
+
+
+def playlist_model_has_field(field: str) -> bool:
+    return hasattr(Playlist, field)
+
+
+def mark_playlist_available(playlist: Playlist, checked_at: datetime | None = None):
+    checked_at = checked_at or datetime.utcnow()
+
+    safe_set(playlist, "is_active", True)
+    safe_set(playlist, "is_available", True)
+    safe_set(playlist, "unavailable_since", None)
+    safe_set(playlist, "last_checked_at", checked_at)
+    safe_set(playlist, "updated_at", checked_at)
+
+
+def mark_playlist_unavailable(playlist: Playlist, checked_at: datetime | None = None):
+    checked_at = checked_at or datetime.utcnow()
+
+    safe_set(playlist, "is_active", False)
+    safe_set(playlist, "is_available", False)
+
+    if hasattr(playlist, "unavailable_since") and getattr(playlist, "unavailable_since", None) is None:
+        setattr(playlist, "unavailable_since", checked_at)
+
+    safe_set(playlist, "last_checked_at", checked_at)
+    safe_set(playlist, "updated_at", checked_at)
+
+
+def filter_available_playlists(query):
+    """Hide playlists that were marked unavailable during Spotify sync.
+
+    This is intentionally defensive: if the current Playlist model/database does
+    not have these columns yet, the query still works and returns all playlists.
+    """
+    if playlist_model_has_field("is_active"):
+        query = query.filter(or_(Playlist.is_active.is_(True), Playlist.is_active.is_(None)))
+
+    if playlist_model_has_field("is_available"):
+        query = query.filter(or_(Playlist.is_available.is_(True), Playlist.is_available.is_(None)))
+
+    return query
 
 
 def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
@@ -314,6 +357,14 @@ def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta 
     return {
         "id": playlist.id,
         "account_id": playlist.account_id,
+        "is_active": getattr(playlist, "is_active", True),
+        "is_available": getattr(playlist, "is_available", True),
+        "unavailable_since": playlist.unavailable_since.isoformat()
+        if getattr(playlist, "unavailable_since", None)
+        else None,
+        "last_checked_at": playlist.last_checked_at.isoformat()
+        if getattr(playlist, "last_checked_at", None)
+        else None,
         "spotify_id": spotify_id,
         "spotify_playlist_id": spotify_id,
         "name": getattr(playlist, "name", "Untitled Playlist"),
@@ -422,7 +473,7 @@ def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: di
     if followers is not None:
       safe_set(playlist, "followers", followers)
 
-    safe_set(playlist, "updated_at", datetime.utcnow())
+    mark_playlist_available(playlist, datetime.utcnow())
 
 
 def refresh_account_playlists_from_spotify(db: Session, account_id: int):
@@ -431,7 +482,37 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
     imported = 0
     updated = 0
+    unavailable = 0
     now = datetime.utcnow()
+    current_spotify_ids = {item.get("id") for item in spotify_items if item.get("id")}
+
+    # First, mark DB playlists that Spotify no longer returns as unavailable.
+    # We hide them from the website, but keep the row/history for reporting.
+    existing_playlists = (
+        db.query(Playlist)
+        .filter(Playlist.account_id == account_id)
+        .all()
+    )
+
+    for existing_playlist in existing_playlists:
+        existing_spotify_id = (
+            getattr(existing_playlist, "spotify_id", None)
+            or getattr(existing_playlist, "spotify_playlist_id", None)
+        )
+
+        # Keep manual/local rows without a Spotify ID visible.
+        if not existing_spotify_id:
+            continue
+
+        if existing_spotify_id not in current_spotify_ids:
+            was_available = (
+                getattr(existing_playlist, "is_available", True) is not False
+                or getattr(existing_playlist, "is_active", True) is not False
+            )
+            mark_playlist_unavailable(existing_playlist, now)
+            db.add(existing_playlist)
+            if was_available:
+                unavailable += 1
 
     for item in spotify_items:
         spotify_id = item.get("id")
@@ -443,6 +524,13 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             .filter(Playlist.account_id == account_id, Playlist.spotify_id == spotify_id)
             .first()
         )
+
+        if not playlist and playlist_model_has_field("spotify_playlist_id"):
+            playlist = (
+                db.query(Playlist)
+                .filter(Playlist.account_id == account_id, Playlist.spotify_playlist_id == spotify_id)
+                .first()
+            )
 
         if playlist:
             updated += 1
@@ -475,7 +563,12 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
     db.commit()
 
-    return {"imported": imported, "updated": updated, "total": len(spotify_items)}
+    return {
+        "imported": imported,
+        "updated": updated,
+        "unavailable": unavailable,
+        "total": len(spotify_items),
+    }
 
 
 def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spotify_playlist_id: str):
@@ -540,8 +633,9 @@ def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spo
 @router.get("/api/accounts/{account_id}/playlists")
 def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
     playlists = (
-        db.query(Playlist)
-        .filter(Playlist.account_id == account_id)
+        filter_available_playlists(
+            db.query(Playlist).filter(Playlist.account_id == account_id)
+        )
         .order_by(Playlist.name.asc())
         .all()
     )
@@ -590,8 +684,9 @@ def sync_account_playlists_api(
     result = refresh_account_playlists_from_spotify(db, account_id)
 
     playlists = (
-        db.query(Playlist)
-        .filter(Playlist.account_id == account_id)
+        filter_available_playlists(
+            db.query(Playlist).filter(Playlist.account_id == account_id)
+        )
         .order_by(Playlist.id.asc())
         .offset(offset)
         .limit(limit)
@@ -610,6 +705,7 @@ def sync_account_playlists_api(
         "message": "Spotify playlists refreshed",
         "imported": result["imported"],
         "updated": result["updated"],
+        "unavailable": result.get("unavailable", 0),
         "total": result["total"],
         "items": [
             serialize_playlist(
@@ -704,6 +800,8 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
         if detail:
             update_playlist_from_spotify_item(playlist, detail, detail)
+        else:
+            mark_playlist_unavailable(playlist, datetime.utcnow())
 
     now = datetime.utcnow()
     history = FollowerHistory(
