@@ -53,6 +53,14 @@ class Playlist(Base):
 
     public = Column(Boolean, nullable=True, default=True)
 
+    # Used by the sync job to hide Spotify playlists that were deleted,
+    # removed from the account, or are no longer available from Spotify.
+    # We keep the database row and follower history instead of deleting it.
+    is_active = Column(Boolean, nullable=True, default=True, index=True)
+    is_available = Column(Boolean, nullable=True, default=True, index=True)
+    unavailable_since = Column(DateTime, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+
     created_at = Column(
         DateTime,
         nullable=False,

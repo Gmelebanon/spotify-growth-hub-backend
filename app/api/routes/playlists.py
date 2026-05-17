@@ -114,6 +114,99 @@ def filter_available_playlists(query):
     return query
 
 
+def normalize_playlist_name(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def playlist_identity_key(playlist: Playlist):
+    """Return a stable key used to collapse duplicate playlist rows.
+
+    Spotify ID is the safest key. For older broken rows that were created
+    without a Spotify ID, we fall back to account + normalized name so the UI
+    does not show many copies of the same playlist.
+    """
+    account_id = getattr(playlist, "account_id", None)
+    spotify_id = (
+        getattr(playlist, "spotify_id", None)
+        or getattr(playlist, "spotify_playlist_id", None)
+    )
+
+    if spotify_id:
+        return ("spotify", account_id, spotify_id)
+
+    return ("name", account_id, normalize_playlist_name(getattr(playlist, "name", None)))
+
+
+def playlist_dedupe_score(playlist: Playlist):
+    """Higher score wins when duplicate rows exist."""
+    has_spotify_id = 1 if (
+        getattr(playlist, "spotify_id", None)
+        or getattr(playlist, "spotify_playlist_id", None)
+    ) else 0
+    is_available = 1 if getattr(playlist, "is_available", True) is not False else 0
+    is_active = 1 if getattr(playlist, "is_active", True) is not False else 0
+    followers = getattr(playlist, "followers", 0) or 0
+    tracks = (
+        getattr(playlist, "tracks_count", 0)
+        or getattr(playlist, "tracks_total", 0)
+        or getattr(playlist, "total_tracks", 0)
+        or 0
+    )
+    updated_at = getattr(playlist, "updated_at", None) or datetime.min
+    created_at = getattr(playlist, "created_at", None) or datetime.min
+
+    return (has_spotify_id, is_available, is_active, followers, tracks, updated_at, created_at, getattr(playlist, "id", 0) or 0)
+
+
+def dedupe_playlist_rows(playlists: list[Playlist]) -> list[Playlist]:
+    """Return one visible row per playlist identity for API responses."""
+    best_by_key: dict[tuple, Playlist] = {}
+
+    for playlist in playlists:
+        key = playlist_identity_key(playlist)
+        existing = best_by_key.get(key)
+        if existing is None or playlist_dedupe_score(playlist) > playlist_dedupe_score(existing):
+            best_by_key[key] = playlist
+
+    return sorted(best_by_key.values(), key=lambda item: normalize_playlist_name(getattr(item, "name", None)))
+
+
+def mark_duplicate_playlists_unavailable(db: Session, account_id: int, checked_at: datetime | None = None) -> int:
+    """Hide duplicate rows for an account without deleting follower history."""
+    checked_at = checked_at or datetime.utcnow()
+    rows = db.query(Playlist).filter(Playlist.account_id == account_id).all()
+    grouped: dict[tuple, list[Playlist]] = {}
+
+    for row in rows:
+        key = playlist_identity_key(row)
+        # Skip empty-name manual rows because we cannot identify them safely.
+        if key[0] == "name" and not key[2]:
+            continue
+        grouped.setdefault(key, []).append(row)
+
+    hidden = 0
+
+    for duplicates in grouped.values():
+        if len(duplicates) <= 1:
+            continue
+
+        keep = max(duplicates, key=playlist_dedupe_score)
+
+        for row in duplicates:
+            if row.id == keep.id:
+                mark_playlist_available(row, checked_at)
+                db.add(row)
+                continue
+
+            if getattr(row, "is_active", True) is not False or getattr(row, "is_available", True) is not False:
+                hidden += 1
+
+            mark_playlist_unavailable(row, checked_at)
+            db.add(row)
+
+    return hidden
+
+
 def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
     if not account.refresh_token:
         raise HTTPException(
@@ -483,6 +576,7 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     imported = 0
     updated = 0
     unavailable = 0
+    duplicates_hidden = 0
     now = datetime.utcnow()
     current_spotify_ids = {item.get("id") for item in spotify_items if item.get("id")}
 
@@ -561,12 +655,15 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             db.rollback()
             db.begin()
 
+    duplicates_hidden = mark_duplicate_playlists_unavailable(db, account_id, now)
+
     db.commit()
 
     return {
         "imported": imported,
         "updated": updated,
         "unavailable": unavailable,
+        "duplicates_hidden": duplicates_hidden,
         "total": len(spotify_items),
     }
 
@@ -639,6 +736,7 @@ def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
         .order_by(Playlist.name.asc())
         .all()
     )
+    playlists = dedupe_playlist_rows(playlists)
 
     playlist_ids = [playlist.id for playlist in playlists]
     meta_rows = (
@@ -688,10 +786,9 @@ def sync_account_playlists_api(
             db.query(Playlist).filter(Playlist.account_id == account_id)
         )
         .order_by(Playlist.id.asc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
+    playlists = dedupe_playlist_rows(playlists)[offset:offset + limit]
 
     playlist_ids = [playlist.id for playlist in playlists]
     meta_rows = (
@@ -706,6 +803,7 @@ def sync_account_playlists_api(
         "imported": result["imported"],
         "updated": result["updated"],
         "unavailable": result.get("unavailable", 0),
+        "duplicates_hidden": result.get("duplicates_hidden", 0),
         "total": result["total"],
         "items": [
             serialize_playlist(
