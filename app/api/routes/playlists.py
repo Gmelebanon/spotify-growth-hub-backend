@@ -6,7 +6,6 @@ from typing import List
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -70,141 +69,6 @@ def get_playlist_or_404(db: Session, account_id: int, playlist_id: int):
 def safe_set(model, field: str, value):
     if hasattr(model, field):
         setattr(model, field, value)
-
-
-def playlist_model_has_field(field: str) -> bool:
-    return hasattr(Playlist, field)
-
-
-def mark_playlist_available(playlist: Playlist, checked_at: datetime | None = None):
-    checked_at = checked_at or datetime.utcnow()
-
-    safe_set(playlist, "is_active", True)
-    safe_set(playlist, "is_available", True)
-    safe_set(playlist, "unavailable_since", None)
-    safe_set(playlist, "last_checked_at", checked_at)
-    safe_set(playlist, "updated_at", checked_at)
-
-
-def mark_playlist_unavailable(playlist: Playlist, checked_at: datetime | None = None):
-    checked_at = checked_at or datetime.utcnow()
-
-    safe_set(playlist, "is_active", False)
-    safe_set(playlist, "is_available", False)
-
-    if hasattr(playlist, "unavailable_since") and getattr(playlist, "unavailable_since", None) is None:
-        setattr(playlist, "unavailable_since", checked_at)
-
-    safe_set(playlist, "last_checked_at", checked_at)
-    safe_set(playlist, "updated_at", checked_at)
-
-
-def filter_available_playlists(query):
-    """Hide playlists that were marked unavailable during Spotify sync.
-
-    This is intentionally defensive: if the current Playlist model/database does
-    not have these columns yet, the query still works and returns all playlists.
-    """
-    if playlist_model_has_field("is_active"):
-        query = query.filter(or_(Playlist.is_active.is_(True), Playlist.is_active.is_(None)))
-
-    if playlist_model_has_field("is_available"):
-        query = query.filter(or_(Playlist.is_available.is_(True), Playlist.is_available.is_(None)))
-
-    return query
-
-
-def normalize_playlist_name(value: str | None) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip().lower())
-
-
-def playlist_identity_key(playlist: Playlist):
-    """Return a stable key used to collapse duplicate playlist rows.
-
-    Spotify ID is the safest key. For older broken rows that were created
-    without a Spotify ID, we fall back to account + normalized name so the UI
-    does not show many copies of the same playlist.
-    """
-    account_id = getattr(playlist, "account_id", None)
-    spotify_id = (
-        getattr(playlist, "spotify_id", None)
-        or getattr(playlist, "spotify_playlist_id", None)
-    )
-
-    if spotify_id:
-        return ("spotify", account_id, spotify_id)
-
-    return ("name", account_id, normalize_playlist_name(getattr(playlist, "name", None)))
-
-
-def playlist_dedupe_score(playlist: Playlist):
-    """Higher score wins when duplicate rows exist."""
-    has_spotify_id = 1 if (
-        getattr(playlist, "spotify_id", None)
-        or getattr(playlist, "spotify_playlist_id", None)
-    ) else 0
-    is_available = 1 if getattr(playlist, "is_available", True) is not False else 0
-    is_active = 1 if getattr(playlist, "is_active", True) is not False else 0
-    followers = getattr(playlist, "followers", 0) or 0
-    tracks = (
-        getattr(playlist, "tracks_count", 0)
-        or getattr(playlist, "tracks_total", 0)
-        or getattr(playlist, "total_tracks", 0)
-        or 0
-    )
-    updated_at = getattr(playlist, "updated_at", None) or datetime.min
-    created_at = getattr(playlist, "created_at", None) or datetime.min
-
-    return (has_spotify_id, is_available, is_active, followers, tracks, updated_at, created_at, getattr(playlist, "id", 0) or 0)
-
-
-def dedupe_playlist_rows(playlists: list[Playlist]) -> list[Playlist]:
-    """Return one visible row per playlist identity for API responses."""
-    best_by_key: dict[tuple, Playlist] = {}
-
-    for playlist in playlists:
-        key = playlist_identity_key(playlist)
-        existing = best_by_key.get(key)
-        if existing is None or playlist_dedupe_score(playlist) > playlist_dedupe_score(existing):
-            best_by_key[key] = playlist
-
-    return sorted(best_by_key.values(), key=lambda item: normalize_playlist_name(getattr(item, "name", None)))
-
-
-def mark_duplicate_playlists_unavailable(db: Session, account_id: int, checked_at: datetime | None = None) -> int:
-    """Hide duplicate rows for an account without deleting follower history."""
-    checked_at = checked_at or datetime.utcnow()
-    rows = db.query(Playlist).filter(Playlist.account_id == account_id).all()
-    grouped: dict[tuple, list[Playlist]] = {}
-
-    for row in rows:
-        key = playlist_identity_key(row)
-        # Skip empty-name manual rows because we cannot identify them safely.
-        if key[0] == "name" and not key[2]:
-            continue
-        grouped.setdefault(key, []).append(row)
-
-    hidden = 0
-
-    for duplicates in grouped.values():
-        if len(duplicates) <= 1:
-            continue
-
-        keep = max(duplicates, key=playlist_dedupe_score)
-
-        for row in duplicates:
-            if row.id == keep.id:
-                mark_playlist_available(row, checked_at)
-                db.add(row)
-                continue
-
-            if getattr(row, "is_active", True) is not False or getattr(row, "is_available", True) is not False:
-                hidden += 1
-
-            mark_playlist_unavailable(row, checked_at)
-            db.add(row)
-
-    return hidden
 
 
 def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
@@ -329,67 +193,34 @@ def compute_growth_stats(playlist: Playlist, history_rows):
     }
 
 
-def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
-    """Return daily follower growth for today and previous days.
+def _history_row_date(row):
+    """Return the calendar date for a follower history row.
 
-    Uses the latest recorded followers for each date. A day needs the previous
-    day's snapshot to calculate growth. Missing data returns 0 so the frontend
-    stays stable until enough daily syncs exist.
+    Prefer the explicit `date` column because imported CSV history uses that.
+    Fall back to created_at for older rows.
     """
-    current_followers = getattr(playlist, "followers", 0) or 0
-    by_date = {}
+    row_date = getattr(row, "date", None)
 
-    for row in history_rows or []:
-        if not row.created_at:
-            continue
-        day_key = row.created_at.date().isoformat()
-        existing = by_date.get(day_key)
-        if existing is None or row.created_at > existing.created_at:
-            by_date[day_key] = row
+    if not row_date and getattr(row, "created_at", None):
+        row_date = row.created_at.date()
 
-    today = datetime.utcnow().date()
-    today_key = today.isoformat()
-    if today_key not in by_date:
-        by_date[today_key] = type("Snapshot", (), {"followers": current_followers, "created_at": datetime.utcnow()})()
+    if not row_date:
+        return None
 
-    values = []
-    for offset in range(days):
-        day = today - timedelta(days=offset)
-        prev_day = day - timedelta(days=1)
-        row = by_date.get(day.isoformat())
-        prev_row = by_date.get(prev_day.isoformat())
-        if row is None or prev_row is None:
-            growth_value = 0
-        else:
-            growth_value = (row.followers or 0) - (prev_row.followers or 0)
-        values.append({
-            "date": day.isoformat(),
-            "label": f"{day.month}/{day.day}",
-            "growth": growth_value,
-        })
+    if hasattr(row_date, "date"):
+        row_date = row_date.date()
 
-    return values
+    return row_date
 
-def build_daily_history(history_rows):
-    rows = [
-        row
-        for row in history_rows
-        if getattr(row, "created_at", None) or getattr(row, "date", None)
-    ]
 
+def _latest_history_by_date(history_rows):
+    """Keep one history row per date, choosing the latest created_at row."""
     latest_by_date = {}
 
-    for row in rows:
-        row_date = getattr(row, "date", None)
-
-        if not row_date and getattr(row, "created_at", None):
-            row_date = row.created_at.date()
-
+    for row in history_rows or []:
+        row_date = _history_row_date(row)
         if not row_date:
             continue
-
-        if hasattr(row_date, "date"):
-            row_date = row_date.date()
 
         key = row_date.isoformat()
         existing = latest_by_date.get(key)
@@ -407,31 +238,50 @@ def build_daily_history(history_rows):
         elif row_created and not existing_created:
             latest_by_date[key] = row
 
-    ordered_dates_asc = sorted(latest_by_date.keys())
+    return latest_by_date
 
-    previous_followers = None
-    by_date_with_growth = {}
 
-    for current_date in ordered_dates_asc:
-        current_row = latest_by_date[current_date]
-        followers = getattr(current_row, "followers", 0) or 0
+def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
+    """Return daily playlist stats for today and previous days.
 
-        growth = 0 if previous_followers is None else followers - previous_followers
+    Your imported Excel/CSV data stores the daily stat directly in
+    follower_history.followers. So the table should display that value directly
+    instead of calculating: today followers - previous day followers.
+    """
+    by_date = _latest_history_by_date(history_rows)
+    today = datetime.utcnow().date()
 
-        by_date_with_growth[current_date] = {
-            "date": current_date,
-            "followers": followers,
-            "growth": growth,
-            "value": growth,
-            "count": growth,
-        }
+    values = []
+    for offset in range(days):
+        day = today - timedelta(days=offset)
+        row = by_date.get(day.isoformat())
 
-        previous_followers = followers
+        growth_value = getattr(row, "followers", 0) or 0 if row else 0
+
+        values.append({
+            "date": day.isoformat(),
+            "label": f"{day.month}/{day.day}",
+            "growth": growth_value,
+        })
+
+    return values
+
+
+def build_daily_history(history_rows):
+    """Return imported daily stat history using follower_history.followers directly."""
+    latest_by_date = _latest_history_by_date(history_rows)
 
     return [
-        by_date_with_growth[current_date]
-        for current_date in sorted(by_date_with_growth.keys(), reverse=True)
+        {
+            "date": current_date,
+            "followers": getattr(latest_by_date[current_date], "followers", 0) or 0,
+            "growth": getattr(latest_by_date[current_date], "followers", 0) or 0,
+            "value": getattr(latest_by_date[current_date], "followers", 0) or 0,
+            "count": getattr(latest_by_date[current_date], "followers", 0) or 0,
+        }
+        for current_date in sorted(latest_by_date.keys(), reverse=True)
     ]
+
 
 def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta | None = None):
     spotify_id = getattr(playlist, "spotify_id", None)
@@ -450,14 +300,6 @@ def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta 
     return {
         "id": playlist.id,
         "account_id": playlist.account_id,
-        "is_active": getattr(playlist, "is_active", True),
-        "is_available": getattr(playlist, "is_available", True),
-        "unavailable_since": playlist.unavailable_since.isoformat()
-        if getattr(playlist, "unavailable_since", None)
-        else None,
-        "last_checked_at": playlist.last_checked_at.isoformat()
-        if getattr(playlist, "last_checked_at", None)
-        else None,
         "spotify_id": spotify_id,
         "spotify_playlist_id": spotify_id,
         "name": getattr(playlist, "name", "Untitled Playlist"),
@@ -566,7 +408,7 @@ def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: di
     if followers is not None:
       safe_set(playlist, "followers", followers)
 
-    mark_playlist_available(playlist, datetime.utcnow())
+    safe_set(playlist, "updated_at", datetime.utcnow())
 
 
 def refresh_account_playlists_from_spotify(db: Session, account_id: int):
@@ -575,38 +417,7 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
     imported = 0
     updated = 0
-    unavailable = 0
-    duplicates_hidden = 0
     now = datetime.utcnow()
-    current_spotify_ids = {item.get("id") for item in spotify_items if item.get("id")}
-
-    # First, mark DB playlists that Spotify no longer returns as unavailable.
-    # We hide them from the website, but keep the row/history for reporting.
-    existing_playlists = (
-        db.query(Playlist)
-        .filter(Playlist.account_id == account_id)
-        .all()
-    )
-
-    for existing_playlist in existing_playlists:
-        existing_spotify_id = (
-            getattr(existing_playlist, "spotify_id", None)
-            or getattr(existing_playlist, "spotify_playlist_id", None)
-        )
-
-        # Keep manual/local rows without a Spotify ID visible.
-        if not existing_spotify_id:
-            continue
-
-        if existing_spotify_id not in current_spotify_ids:
-            was_available = (
-                getattr(existing_playlist, "is_available", True) is not False
-                or getattr(existing_playlist, "is_active", True) is not False
-            )
-            mark_playlist_unavailable(existing_playlist, now)
-            db.add(existing_playlist)
-            if was_available:
-                unavailable += 1
 
     for item in spotify_items:
         spotify_id = item.get("id")
@@ -618,13 +429,6 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             .filter(Playlist.account_id == account_id, Playlist.spotify_id == spotify_id)
             .first()
         )
-
-        if not playlist and playlist_model_has_field("spotify_playlist_id"):
-            playlist = (
-                db.query(Playlist)
-                .filter(Playlist.account_id == account_id, Playlist.spotify_playlist_id == spotify_id)
-                .first()
-            )
 
         if playlist:
             updated += 1
@@ -655,17 +459,9 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             db.rollback()
             db.begin()
 
-    duplicates_hidden = mark_duplicate_playlists_unavailable(db, account_id, now)
-
     db.commit()
 
-    return {
-        "imported": imported,
-        "updated": updated,
-        "unavailable": unavailable,
-        "duplicates_hidden": duplicates_hidden,
-        "total": len(spotify_items),
-    }
+    return {"imported": imported, "updated": updated, "total": len(spotify_items)}
 
 
 def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spotify_playlist_id: str):
@@ -730,13 +526,11 @@ def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spo
 @router.get("/api/accounts/{account_id}/playlists")
 def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
     playlists = (
-        filter_available_playlists(
-            db.query(Playlist).filter(Playlist.account_id == account_id)
-        )
+        db.query(Playlist)
+        .filter(Playlist.account_id == account_id)
         .order_by(Playlist.name.asc())
         .all()
     )
-    playlists = dedupe_playlist_rows(playlists)
 
     playlist_ids = [playlist.id for playlist in playlists]
     meta_rows = (
@@ -782,13 +576,13 @@ def sync_account_playlists_api(
     result = refresh_account_playlists_from_spotify(db, account_id)
 
     playlists = (
-        filter_available_playlists(
-            db.query(Playlist).filter(Playlist.account_id == account_id)
-        )
+        db.query(Playlist)
+        .filter(Playlist.account_id == account_id)
         .order_by(Playlist.id.asc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
-    playlists = dedupe_playlist_rows(playlists)[offset:offset + limit]
 
     playlist_ids = [playlist.id for playlist in playlists]
     meta_rows = (
@@ -802,8 +596,6 @@ def sync_account_playlists_api(
         "message": "Spotify playlists refreshed",
         "imported": result["imported"],
         "updated": result["updated"],
-        "unavailable": result.get("unavailable", 0),
-        "duplicates_hidden": result.get("duplicates_hidden", 0),
         "total": result["total"],
         "items": [
             serialize_playlist(
@@ -898,8 +690,6 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
         if detail:
             update_playlist_from_spotify_item(playlist, detail, detail)
-        else:
-            mark_playlist_unavailable(playlist, datetime.utcnow())
 
     now = datetime.utcnow()
     history = FollowerHistory(
