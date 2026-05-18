@@ -1,22 +1,50 @@
 import os
 import re
+import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.follower_history import FollowerHistory
 from app.models.playlist import Playlist
 from app.models.ads_meta import AdsMeta
 from app.models.spotify_account import SpotifyAccount
 
 router = APIRouter(tags=["playlists"])
+
+
+SPOTIFY_REQUEST_DELAY_SECONDS = float(os.getenv("SPOTIFY_REQUEST_DELAY_SECONDS", "0.45"))
+SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS = float(os.getenv("SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS", "5"))
+SPOTIFY_MAX_RETRIES = int(os.getenv("SPOTIFY_MAX_RETRIES", "4"))
+SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT = int(os.getenv("SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT", "100"))
+
+
+def sleep_between_spotify_requests():
+    """Small jittered cooldown to avoid hammering Spotify during sync jobs."""
+    if SPOTIFY_REQUEST_DELAY_SECONDS <= 0:
+        return
+
+    lower = max(0, SPOTIFY_REQUEST_DELAY_SECONDS * 0.7)
+    upper = max(lower, SPOTIFY_REQUEST_DELAY_SECONDS * 1.3)
+    time.sleep(random.uniform(lower, upper))
+
+
+def parse_retry_after_seconds(value: str | None, fallback: int = 5) -> int:
+    if not value:
+        return fallback
+
+    try:
+        return max(1, int(float(value)))
+    except Exception:
+        return fallback
+
 
 
 class UpdateAdsMetaRequest(BaseModel):
@@ -124,20 +152,16 @@ def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
 
 
 def spotify_request(db: Session, account: SpotifyAccount, method: str, url: str, **kwargs):
+    """Make a Spotify Web API request with token refresh, cooldown, and 429 retry handling."""
     access_token = account.access_token or refresh_spotify_access_token(db, account)
     headers = kwargs.pop("headers", {})
     timeout = kwargs.pop("timeout", 30)
 
-    response = requests.request(
-        method,
-        url,
-        headers={**headers, "Authorization": f"Bearer {access_token}"},
-        timeout=timeout,
-        **kwargs,
-    )
+    last_response = None
 
-    if response.status_code == 401:
-        access_token = refresh_spotify_access_token(db, account)
+    for attempt in range(max(1, SPOTIFY_MAX_RETRIES)):
+        sleep_between_spotify_requests()
+
         response = requests.request(
             method,
             url,
@@ -145,8 +169,34 @@ def spotify_request(db: Session, account: SpotifyAccount, method: str, url: str,
             timeout=timeout,
             **kwargs,
         )
+        last_response = response
 
-    return response
+        if response.status_code == 401:
+            access_token = refresh_spotify_access_token(db, account)
+            sleep_between_spotify_requests()
+
+            response = requests.request(
+                method,
+                url,
+                headers={**headers, "Authorization": f"Bearer {access_token}"},
+                timeout=timeout,
+                **kwargs,
+            )
+            last_response = response
+
+        if response.status_code != 429:
+            return response
+
+        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
+        wait_seconds = retry_after + 1
+
+        print(
+            f"Spotify rate limited account={getattr(account, 'id', 'unknown')} "
+            f"attempt={attempt + 1}/{SPOTIFY_MAX_RETRIES}; waiting {wait_seconds}s"
+        )
+        time.sleep(wait_seconds)
+
+    return last_response
 
 
 def get_history_rows(db: Session, playlist_id: int, limit: int | None = None):
@@ -240,108 +290,6 @@ def _latest_history_by_date(history_rows):
             latest_by_date[key] = row
 
     return latest_by_date
-
-def get_spotify_followers_total(item: dict | None, detail: dict | None = None):
-    """Extract Spotify's current total followers from a playlist payload."""
-    source = detail or item or {}
-    followers = (source.get("followers") or {}).get("total")
-
-    if followers is None:
-        return None
-
-    try:
-        return int(followers)
-    except Exception:
-        return None
-
-
-def get_history_rows_for_date(db: Session, playlist_id: int, target_date):
-    """Return follower_history rows for one playlist/date.
-
-    Imported rows use the explicit date column. Older rows may only have
-    created_at, so we check both.
-    """
-    start = datetime.combine(target_date, datetime.min.time())
-    end = start + timedelta(days=1)
-
-    conditions = [
-        (FollowerHistory.created_at >= start) & (FollowerHistory.created_at < end)
-    ]
-
-    if hasattr(FollowerHistory, "date"):
-        conditions.append(FollowerHistory.date == target_date)
-
-    return (
-        db.query(FollowerHistory)
-        .filter(FollowerHistory.playlist_id == playlist_id)
-        .filter(or_(*conditions))
-        .order_by(FollowerHistory.created_at.desc())
-        .all()
-    )
-
-
-def replace_history_value_for_date(db: Session, playlist_id: int, target_date, value: int, captured_at: datetime):
-    """Replace one playlist's daily history value for a date."""
-    rows = get_history_rows_for_date(db, playlist_id, target_date)
-
-    for row in rows:
-        db.delete(row)
-
-    history = FollowerHistory(
-        playlist_id=playlist_id,
-        followers=value,
-        created_at=datetime.combine(target_date, datetime.min.time()),
-    )
-    safe_set(history, "date", target_date)
-
-    db.add(history)
-    db.flush()
-
-    return value
-
-
-def save_daily_growth_from_spotify_sync(
-    db: Session,
-    playlist: Playlist,
-    previous_total_followers: int | None,
-    current_total_followers: int | None,
-    captured_at: datetime | None = None,
-):
-    """Store daily growth, not total followers, during manual/auto Spotify sync.
-
-    Spotify only returns current total followers. The only safe daily value we
-    can create during sync is the delta between the current total and the total
-    saved on the playlist row before this sync.
-
-    If today's row already has a small daily value, we add the new delta to it
-    so repeated syncs during the same day do not reset the day back to zero.
-    If today's existing value is suspiciously large, it is treated as a bad
-    old total-follower row and replaced.
-    """
-    captured_at = captured_at or datetime.utcnow()
-    target_date = captured_at.date()
-
-    if current_total_followers is None or previous_total_followers is None:
-        delta = 0
-    else:
-        delta = current_total_followers - previous_total_followers
-
-    existing_rows = get_history_rows_for_date(db, playlist.id, target_date)
-    existing_values = [getattr(row, "followers", 0) or 0 for row in existing_rows]
-
-    # Your imported daily values are small (-2 to 37 in the checked import).
-    # Values like 488, 855, 2148 are old total-follower rows and should be
-    # replaced, not preserved.
-    valid_existing_values = [value for value in existing_values if abs(value) <= 100]
-
-    if valid_existing_values:
-        existing_value = valid_existing_values[0]
-        new_value = existing_value + delta if delta != 0 else existing_value
-    else:
-        new_value = delta
-
-    return replace_history_value_for_date(db, playlist.id, target_date, new_value, captured_at)
-
 
 
 def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
@@ -545,22 +493,19 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             imported += 1
 
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
-        previous_total_followers = getattr(playlist, "followers", None)
-        current_total_followers = get_spotify_followers_total(item, detail)
-
         update_playlist_from_spotify_item(playlist, item, detail)
 
         db.add(playlist)
         db.flush()
 
         try:
-            save_daily_growth_from_spotify_sync(
-                db,
-                playlist,
-                previous_total_followers,
-                current_total_followers,
-                now,
+            history = FollowerHistory(
+                playlist_id=playlist.id,
+                followers=getattr(playlist, "followers", 0) or 0,
+                created_at=now,
             )
+            db.add(history)
+            db.flush()
         except Exception:
             db.rollback()
             db.begin()
@@ -791,27 +736,22 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
     account = get_account_or_404(db, account_id)
     playlist = get_playlist_or_404(db, account_id, playlist_id)
 
-    now = datetime.utcnow()
     spotify_id = getattr(playlist, "spotify_id", None)
-    previous_total_followers = getattr(playlist, "followers", None)
-    current_total_followers = None
-
     if spotify_id:
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
         if detail:
-            current_total_followers = get_spotify_followers_total(detail, detail)
             update_playlist_from_spotify_item(playlist, detail, detail)
+
+    now = datetime.utcnow()
+    history = FollowerHistory(
+        playlist_id=playlist.id,
+        followers=getattr(playlist, "followers", 0) or 0,
+        created_at=now,
+    )
 
     try:
         db.add(playlist)
-        db.flush()
-        save_daily_growth_from_spotify_sync(
-            db,
-            playlist,
-            previous_total_followers,
-            current_total_followers,
-            now,
-        )
+        db.add(history)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -978,6 +918,24 @@ def replace_playlist_tracks_legacy(
     return replace_playlist_tracks_logic(account_id, playlist_id, payload, db)
 
 
+def run_silent_sync_for_accounts(account_ids: list[int]):
+    """Run sync outside the request response so cron receives a tiny response."""
+    db_session = SessionLocal()
+    try:
+        for index, account_id in enumerate(account_ids):
+            try:
+                refresh_account_playlists_from_spotify(db_session, account_id)
+                print(f"Synced account {account_id}")
+            except Exception as exc:
+                db_session.rollback()
+                print(f"Sync failed for account {account_id}: {exc}")
+
+            if index < len(account_ids) - 1 and SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS > 0:
+                time.sleep(SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS)
+    finally:
+        db_session.close()
+
+
 @router.post("/api/playlists/sync-all")
 def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     account_ids = [
@@ -985,22 +943,19 @@ def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depe
         for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
     ]
 
-    def run_sync_for_accounts(ids: list[int]):
-        db_session = next(get_db())
-        try:
-            for account_id in ids:
-                try:
-                    refresh_account_playlists_from_spotify(db_session, account_id)
-                    print(f"Synced account {account_id}")
-                except Exception as exc:
-                    print(f"Sync failed for account {account_id}: {exc}")
-        finally:
-            db_session.close()
+    background_tasks.add_task(run_silent_sync_for_accounts, account_ids)
 
-    background_tasks.add_task(run_sync_for_accounts, account_ids)
+    # Keep cron-job.org response tiny; the actual sync continues in the background.
+    return {
+        "success": True,
+        "message": "Sync started",
+        "accounts": len(account_ids),
+    }
 
-    # Keep cron-job.org response very small. The actual sync continues in the background.
-    return {"success": True, "message": "Sync started"}
+
+@router.get("/api/playlists/sync-all")
+def sync_all_playlists_get_api(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    return sync_all_playlists_api(background_tasks, db)
 
 
 class CreatePlaylistRequest(BaseModel):
