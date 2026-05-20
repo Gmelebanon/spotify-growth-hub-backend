@@ -1,7 +1,5 @@
 import os
 import re
-import random
-import time
 from datetime import datetime, timedelta, timezone
 from typing import List
 
@@ -11,40 +9,13 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db, SessionLocal
+from app.core.database import get_db
 from app.models.follower_history import FollowerHistory
 from app.models.playlist import Playlist
 from app.models.ads_meta import AdsMeta
 from app.models.spotify_account import SpotifyAccount
 
 router = APIRouter(tags=["playlists"])
-
-
-SPOTIFY_REQUEST_DELAY_SECONDS = float(os.getenv("SPOTIFY_REQUEST_DELAY_SECONDS", "0.45"))
-SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS = float(os.getenv("SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS", "5"))
-SPOTIFY_MAX_RETRIES = int(os.getenv("SPOTIFY_MAX_RETRIES", "4"))
-SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT = int(os.getenv("SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT", "100"))
-
-
-def sleep_between_spotify_requests():
-    """Small jittered cooldown to avoid hammering Spotify during sync jobs."""
-    if SPOTIFY_REQUEST_DELAY_SECONDS <= 0:
-        return
-
-    lower = max(0, SPOTIFY_REQUEST_DELAY_SECONDS * 0.7)
-    upper = max(lower, SPOTIFY_REQUEST_DELAY_SECONDS * 1.3)
-    time.sleep(random.uniform(lower, upper))
-
-
-def parse_retry_after_seconds(value: str | None, fallback: int = 5) -> int:
-    if not value:
-        return fallback
-
-    try:
-        return max(1, int(float(value)))
-    except Exception:
-        return fallback
-
 
 
 class UpdateAdsMetaRequest(BaseModel):
@@ -152,16 +123,20 @@ def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
 
 
 def spotify_request(db: Session, account: SpotifyAccount, method: str, url: str, **kwargs):
-    """Make a Spotify Web API request with token refresh, cooldown, and 429 retry handling."""
     access_token = account.access_token or refresh_spotify_access_token(db, account)
     headers = kwargs.pop("headers", {})
     timeout = kwargs.pop("timeout", 30)
 
-    last_response = None
+    response = requests.request(
+        method,
+        url,
+        headers={**headers, "Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+        **kwargs,
+    )
 
-    for attempt in range(max(1, SPOTIFY_MAX_RETRIES)):
-        sleep_between_spotify_requests()
-
+    if response.status_code == 401:
+        access_token = refresh_spotify_access_token(db, account)
         response = requests.request(
             method,
             url,
@@ -169,34 +144,8 @@ def spotify_request(db: Session, account: SpotifyAccount, method: str, url: str,
             timeout=timeout,
             **kwargs,
         )
-        last_response = response
 
-        if response.status_code == 401:
-            access_token = refresh_spotify_access_token(db, account)
-            sleep_between_spotify_requests()
-
-            response = requests.request(
-                method,
-                url,
-                headers={**headers, "Authorization": f"Bearer {access_token}"},
-                timeout=timeout,
-                **kwargs,
-            )
-            last_response = response
-
-        if response.status_code != 429:
-            return response
-
-        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
-        wait_seconds = retry_after + 1
-
-        print(
-            f"Spotify rate limited account={getattr(account, 'id', 'unknown')} "
-            f"attempt={attempt + 1}/{SPOTIFY_MAX_RETRIES}; waiting {wait_seconds}s"
-        )
-        time.sleep(wait_seconds)
-
-    return last_response
+    return response
 
 
 def get_history_rows(db: Session, playlist_id: int, limit: int | None = None):
@@ -244,34 +193,67 @@ def compute_growth_stats(playlist: Playlist, history_rows):
     }
 
 
-def _history_row_date(row):
-    """Return the calendar date for a follower history row.
+def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
+    """Return daily follower growth for today and previous days.
 
-    Prefer the explicit `date` column because imported CSV history uses that.
-    Fall back to created_at for older rows.
+    Uses the latest recorded followers for each date. A day needs the previous
+    day's snapshot to calculate growth. Missing data returns 0 so the frontend
+    stays stable until enough daily syncs exist.
     """
-    row_date = getattr(row, "date", None)
-
-    if not row_date and getattr(row, "created_at", None):
-        row_date = row.created_at.date()
-
-    if not row_date:
-        return None
-
-    if hasattr(row_date, "date"):
-        row_date = row_date.date()
-
-    return row_date
-
-
-def _latest_history_by_date(history_rows):
-    """Keep one history row per date, choosing the latest created_at row."""
-    latest_by_date = {}
+    current_followers = getattr(playlist, "followers", 0) or 0
+    by_date = {}
 
     for row in history_rows or []:
-        row_date = _history_row_date(row)
+        if not row.created_at:
+            continue
+        day_key = row.created_at.date().isoformat()
+        existing = by_date.get(day_key)
+        if existing is None or row.created_at > existing.created_at:
+            by_date[day_key] = row
+
+    today = datetime.utcnow().date()
+    today_key = today.isoformat()
+    if today_key not in by_date:
+        by_date[today_key] = type("Snapshot", (), {"followers": current_followers, "created_at": datetime.utcnow()})()
+
+    values = []
+    for offset in range(days):
+        day = today - timedelta(days=offset)
+        prev_day = day - timedelta(days=1)
+        row = by_date.get(day.isoformat())
+        prev_row = by_date.get(prev_day.isoformat())
+        if row is None or prev_row is None:
+            growth_value = 0
+        else:
+            growth_value = (row.followers or 0) - (prev_row.followers or 0)
+        values.append({
+            "date": day.isoformat(),
+            "label": f"{day.month}/{day.day}",
+            "growth": growth_value,
+        })
+
+    return values
+
+def build_daily_history(history_rows):
+    rows = [
+        row
+        for row in history_rows
+        if getattr(row, "created_at", None) or getattr(row, "date", None)
+    ]
+
+    latest_by_date = {}
+
+    for row in rows:
+        row_date = getattr(row, "date", None)
+
+        if not row_date and getattr(row, "created_at", None):
+            row_date = row.created_at.date()
+
         if not row_date:
             continue
+
+        if hasattr(row_date, "date"):
+            row_date = row_date.date()
 
         key = row_date.isoformat()
         existing = latest_by_date.get(key)
@@ -289,50 +271,31 @@ def _latest_history_by_date(history_rows):
         elif row_created and not existing_created:
             latest_by_date[key] = row
 
-    return latest_by_date
+    ordered_dates_asc = sorted(latest_by_date.keys())
 
+    previous_followers = None
+    by_date_with_growth = {}
 
-def compute_daily_growth_stats(playlist: Playlist, history_rows, days: int = 30):
-    """Return daily playlist stats for today and previous days.
+    for current_date in ordered_dates_asc:
+        current_row = latest_by_date[current_date]
+        followers = getattr(current_row, "followers", 0) or 0
 
-    Your imported Excel/CSV data stores the daily stat directly in
-    follower_history.followers. So the table should display that value directly
-    instead of calculating: today followers - previous day followers.
-    """
-    by_date = _latest_history_by_date(history_rows)
-    today = datetime.utcnow().date()
+        growth = 0 if previous_followers is None else followers - previous_followers
 
-    values = []
-    for offset in range(days):
-        day = today - timedelta(days=offset)
-        row = by_date.get(day.isoformat())
+        by_date_with_growth[current_date] = {
+            "date": current_date,
+            "followers": followers,
+            "growth": growth,
+            "value": growth,
+            "count": growth,
+        }
 
-        growth_value = getattr(row, "followers", 0) or 0 if row else 0
-
-        values.append({
-            "date": day.isoformat(),
-            "label": f"{day.month}/{day.day}",
-            "growth": growth_value,
-        })
-
-    return values
-
-
-def build_daily_history(history_rows):
-    """Return imported daily stat history using follower_history.followers directly."""
-    latest_by_date = _latest_history_by_date(history_rows)
+        previous_followers = followers
 
     return [
-        {
-            "date": current_date,
-            "followers": getattr(latest_by_date[current_date], "followers", 0) or 0,
-            "growth": getattr(latest_by_date[current_date], "followers", 0) or 0,
-            "value": getattr(latest_by_date[current_date], "followers", 0) or 0,
-            "count": getattr(latest_by_date[current_date], "followers", 0) or 0,
-        }
-        for current_date in sorted(latest_by_date.keys(), reverse=True)
+        by_date_with_growth[current_date]
+        for current_date in sorted(by_date_with_growth.keys(), reverse=True)
     ]
-
 
 def serialize_playlist(playlist: Playlist, history_rows=None, ads_meta: AdsMeta | None = None):
     spotify_id = getattr(playlist, "spotify_id", None)
@@ -462,12 +425,112 @@ def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: di
     safe_set(playlist, "updated_at", datetime.utcnow())
 
 
+
+def extract_spotify_followers(item: dict | None, detail: dict | None = None):
+    """Return current total followers from Spotify payload without changing the playlist row."""
+    source = detail or item or {}
+    followers_payload = source.get("followers") or {}
+    followers = followers_payload.get("total")
+
+    if followers is None and item:
+        followers = ((item.get("followers") or {}).get("total"))
+
+    try:
+        return int(followers) if followers is not None else None
+    except Exception:
+        return None
+
+
+def calculate_daily_growth_from_totals(previous_total, current_total) -> int:
+    """Calculate daily growth safely from total follower snapshots.
+
+    follower_history.followers is used by the frontend as the daily value,
+    so Spotify total followers must never be inserted directly into that table.
+    """
+    if current_total is None:
+        return 0
+
+    try:
+        current_total = int(current_total)
+    except Exception:
+        return 0
+
+    if previous_total is None:
+        return 0
+
+    try:
+        previous_total = int(previous_total)
+    except Exception:
+        return 0
+
+    delta = current_total - previous_total
+
+    # Protect the daily table from accidental total-follower inserts.
+    # Small negative values are allowed because playlists can lose followers.
+    if abs(delta) > SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT:
+        print(
+            f"Skipped suspicious daily growth value: previous={previous_total} "
+            f"current={current_total} delta={delta}"
+        )
+        return 0
+
+    return delta
+
+
+def get_existing_history_for_date(db: Session, playlist_id: int, target_date):
+    """Find an existing follower_history row for playlist/date, preferring latest created_at."""
+    query = db.query(FollowerHistory).filter(FollowerHistory.playlist_id == playlist_id)
+
+    if hasattr(FollowerHistory, "date"):
+        query = query.filter(FollowerHistory.date == target_date)
+    else:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = start + timedelta(days=1)
+        query = query.filter(
+            FollowerHistory.created_at >= start,
+            FollowerHistory.created_at < end,
+        )
+
+    return query.order_by(FollowerHistory.created_at.desc()).first()
+
+
+def save_daily_growth_history(db: Session, playlist_id: int, daily_growth: int, now: datetime):
+    """Insert or accumulate the daily growth value for a playlist.
+
+    If sync runs multiple times in the same day, the new delta is added to the
+    existing daily row instead of replacing it with zero.
+    """
+    target_date = now.date()
+    existing = get_existing_history_for_date(db, playlist_id, target_date)
+
+    if existing:
+        existing.followers = (existing.followers or 0) + (daily_growth or 0)
+        existing.created_at = now
+        if hasattr(existing, "date"):
+            existing.date = target_date
+        db.add(existing)
+        return existing, False
+
+    history = FollowerHistory(
+        playlist_id=playlist_id,
+        followers=daily_growth or 0,
+        created_at=now,
+    )
+    if hasattr(history, "date"):
+        history.date = target_date
+
+    db.add(history)
+    return history, True
+
+
 def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     account = get_account_or_404(db, account_id)
     spotify_items = fetch_spotify_account_playlists(db, account)
 
     imported = 0
     updated = 0
+    history_inserted = 0
+    history_updated = 0
     now = datetime.utcnow()
 
     for item in spotify_items:
@@ -481,6 +544,8 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             .first()
         )
 
+        is_new_playlist = playlist is None
+
         if playlist:
             updated += 1
         else:
@@ -492,19 +557,29 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             )
             imported += 1
 
+        previous_total = None if is_new_playlist else getattr(playlist, "followers", None)
+
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
+        current_total = extract_spotify_followers(item, detail)
+
+        daily_growth = calculate_daily_growth_from_totals(previous_total, current_total)
+
         update_playlist_from_spotify_item(playlist, item, detail)
+
+        # playlist.followers stores the current Spotify total.
+        # follower_history.followers stores the daily growth value only.
+        if current_total is not None:
+            safe_set(playlist, "followers", current_total)
 
         db.add(playlist)
         db.flush()
 
         try:
-            history = FollowerHistory(
-                playlist_id=playlist.id,
-                followers=getattr(playlist, "followers", 0) or 0,
-                created_at=now,
-            )
-            db.add(history)
+            _, inserted = save_daily_growth_history(db, playlist.id, daily_growth, now)
+            if inserted:
+                history_inserted += 1
+            else:
+                history_updated += 1
             db.flush()
         except Exception:
             db.rollback()
@@ -512,7 +587,13 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
     db.commit()
 
-    return {"imported": imported, "updated": updated, "total": len(spotify_items)}
+    return {
+        "imported": imported,
+        "updated": updated,
+        "history_inserted": history_inserted,
+        "history_updated": history_updated,
+        "total": len(spotify_items),
+    }
 
 
 def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spotify_playlist_id: str):
@@ -648,6 +729,8 @@ def sync_account_playlists_api(
         "imported": result["imported"],
         "updated": result["updated"],
         "total": result["total"],
+        "history_inserted": result.get("history_inserted", 0),
+        "history_updated": result.get("history_updated", 0),
         "items": [
             serialize_playlist(
                 playlist,
@@ -737,25 +820,34 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
     playlist = get_playlist_or_404(db, account_id, playlist_id)
 
     spotify_id = getattr(playlist, "spotify_id", None)
+    now = datetime.utcnow()
+    daily_growth = 0
+
     if spotify_id:
+        previous_total = getattr(playlist, "followers", None)
         detail = fetch_spotify_playlist_detail(db, account, spotify_id)
         if detail:
+            current_total = extract_spotify_followers(detail, detail)
+            daily_growth = calculate_daily_growth_from_totals(previous_total, current_total)
+
             update_playlist_from_spotify_item(playlist, detail, detail)
 
-    now = datetime.utcnow()
-    history = FollowerHistory(
-        playlist_id=playlist.id,
-        followers=getattr(playlist, "followers", 0) or 0,
-        created_at=now,
-    )
+            # playlist.followers stores the current Spotify total.
+            # follower_history.followers stores the daily growth value only.
+            if current_total is not None:
+                safe_set(playlist, "followers", current_total)
 
     try:
         db.add(playlist)
-        db.add(history)
+        db.flush()
+        save_daily_growth_history(db, playlist.id, daily_growth, now)
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Failed to sync playlist history")
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to sync playlist history: {exc}")
 
     db.refresh(playlist)
     return {"message": "Playlist synced", "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id))}
@@ -918,24 +1010,6 @@ def replace_playlist_tracks_legacy(
     return replace_playlist_tracks_logic(account_id, playlist_id, payload, db)
 
 
-def run_silent_sync_for_accounts(account_ids: list[int]):
-    """Run sync outside the request response so cron receives a tiny response."""
-    db_session = SessionLocal()
-    try:
-        for index, account_id in enumerate(account_ids):
-            try:
-                refresh_account_playlists_from_spotify(db_session, account_id)
-                print(f"Synced account {account_id}")
-            except Exception as exc:
-                db_session.rollback()
-                print(f"Sync failed for account {account_id}: {exc}")
-
-            if index < len(account_ids) - 1 and SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS > 0:
-                time.sleep(SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS)
-    finally:
-        db_session.close()
-
-
 @router.post("/api/playlists/sync-all")
 def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     account_ids = [
@@ -943,19 +1017,22 @@ def sync_all_playlists_api(background_tasks: BackgroundTasks, db: Session = Depe
         for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
     ]
 
-    background_tasks.add_task(run_silent_sync_for_accounts, account_ids)
+    def run_sync_for_accounts(ids: list[int]):
+        db_session = next(get_db())
+        try:
+            for account_id in ids:
+                try:
+                    refresh_account_playlists_from_spotify(db_session, account_id)
+                    print(f"Synced account {account_id}")
+                except Exception as exc:
+                    print(f"Sync failed for account {account_id}: {exc}")
+        finally:
+            db_session.close()
 
-    # Keep cron-job.org response tiny; the actual sync continues in the background.
-    return {
-        "success": True,
-        "message": "Sync started",
-        "accounts": len(account_ids),
-    }
+    background_tasks.add_task(run_sync_for_accounts, account_ids)
 
-
-@router.get("/api/playlists/sync-all")
-def sync_all_playlists_get_api(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    return sync_all_playlists_api(background_tasks, db)
+    # Keep cron-job.org response very small. The actual sync continues in the background.
+    return {"success": True, "message": "Sync started"}
 
 
 class CreatePlaylistRequest(BaseModel):
