@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from supabase import create_client, Client
+from supabase import Client, create_client
 
 
 router = APIRouter(prefix="/api/artist-library", tags=["artist-library"])
