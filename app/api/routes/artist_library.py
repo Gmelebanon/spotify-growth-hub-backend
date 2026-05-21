@@ -1,5 +1,5 @@
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -14,11 +14,11 @@ def get_supabase() -> Client:
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-    if not supabase_url or not supabase_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
-        )
+    if not supabase_url:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL")
+
+    if not supabase_key:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_SERVICE_ROLE_KEY")
 
     return create_client(supabase_url, supabase_key)
 
@@ -71,159 +71,203 @@ def calculate_7_day_followers(
         return 0
 
     previous_followers = int(rows[0].get("followers") or 0)
-
     return int(current_followers) - previous_followers
 
 
 @router.get("")
 def get_artist_library() -> Dict[str, Any]:
-    supabase = get_supabase()
+    try:
+        supabase = get_supabase()
 
-    response = (
-        supabase.table("artist_library")
-        .select("*")
-        .eq("is_active", True)
-        .order("created_at", desc=False)
-        .execute()
-    )
-
-    artists = response.data or []
-
-    enriched_artists = []
-
-    for artist in artists:
-        artist_id = artist.get("artist_id")
-        current_snapshot_response = (
-            supabase.table("artist_follower_snapshots")
-            .select("followers")
-            .eq("artist_id", artist_id)
-            .eq("snapshot_date", date.today().isoformat())
-            .limit(1)
+        response = (
+            supabase.table("artist_library")
+            .select("*")
+            .eq("is_active", True)
+            .order("created_at", desc=False)
             .execute()
         )
 
-        current_snapshot_rows = current_snapshot_response.data or []
-        current_followers = (
-            int(current_snapshot_rows[0].get("followers") or 0)
-            if current_snapshot_rows
-            else 0
-        )
+        artists = response.data or []
+        enriched_artists = []
 
-        followers_7_days = calculate_7_day_followers(
-            supabase=supabase,
-            artist_id=artist_id,
-            current_followers=current_followers,
-        )
+        for artist in artists:
+            artist_id = artist.get("artist_id")
 
-        enriched_artists.append(
-            {
-                "id": artist_id,
-                "artistId": artist_id,
-                "name": artist.get("name"),
-                "spotifyUrl": artist.get("spotify_url"),
-                "image": artist.get("image_url"),
-                "genres": artist.get("genres") or [],
-                "streams": artist.get("streams") or 0,
-                "growthPercent": artist.get("growth_percent") or 0,
-                "followers7Days": followers_7_days,
-                "isActive": artist.get("is_active"),
-                "createdAt": artist.get("created_at"),
-                "updatedAt": artist.get("updated_at"),
-            }
-        )
+            snapshot_response = (
+                supabase.table("artist_follower_snapshots")
+                .select("followers")
+                .eq("artist_id", artist_id)
+                .eq("snapshot_date", date.today().isoformat())
+                .limit(1)
+                .execute()
+            )
 
-    return {
-        "success": True,
-        "artists": enriched_artists,
-    }
+            snapshot_rows = snapshot_response.data or []
+
+            current_followers = (
+                int(snapshot_rows[0].get("followers") or 0)
+                if snapshot_rows
+                else 0
+            )
+
+            followers_7_days = calculate_7_day_followers(
+                supabase=supabase,
+                artist_id=artist_id,
+                current_followers=current_followers,
+            )
+
+            enriched_artists.append(
+                {
+                    "id": artist_id,
+                    "artistId": artist_id,
+                    "name": artist.get("name"),
+                    "spotifyUrl": artist.get("spotify_url"),
+                    "image": artist.get("image_url"),
+                    "genres": artist.get("genres") or [],
+                    "streams": artist.get("streams") or 0,
+                    "growthPercent": artist.get("growth_percent") or 0,
+                    "followers7Days": followers_7_days,
+                    "isActive": artist.get("is_active"),
+                    "createdAt": artist.get("created_at"),
+                    "updatedAt": artist.get("updated_at"),
+                }
+            )
+
+        return {
+            "success": True,
+            "artists": enriched_artists,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Artist library database error: {str(error)}",
+        )
 
 
 @router.post("")
 def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
-    supabase = get_supabase()
+    try:
+        supabase = get_supabase()
 
-    artist_payload = {
-        "artist_id": payload.artist_id,
-        "name": payload.name,
-        "spotify_url": payload.spotify_url,
-        "image_url": payload.image_url,
-        "genres": payload.genres,
-        "streams": payload.streams,
-        "growth_percent": payload.growth_percent,
-        "is_active": True,
-        "updated_at": "now()",
-    }
+        now = datetime.utcnow().isoformat()
 
-    response = (
-        supabase.table("artist_library")
-        .upsert(artist_payload, on_conflict="artist_id")
-        .execute()
-    )
+        artist_payload = {
+            "artist_id": payload.artist_id,
+            "name": payload.name,
+            "spotify_url": payload.spotify_url,
+            "image_url": payload.image_url,
+            "genres": payload.genres,
+            "streams": payload.streams,
+            "growth_percent": payload.growth_percent,
+            "is_active": True,
+            "updated_at": now,
+        }
 
-    return {
-        "success": True,
-        "artist": response.data[0] if response.data else artist_payload,
-    }
+        response = (
+            supabase.table("artist_library")
+            .upsert(artist_payload, on_conflict="artist_id")
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "artist": response.data[0] if response.data else artist_payload,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not add artist: {str(error)}",
+        )
 
 
 @router.delete("/{artist_id}")
 def remove_artist(artist_id: str) -> Dict[str, Any]:
-    supabase = get_supabase()
+    try:
+        supabase = get_supabase()
 
-    response = (
-        supabase.table("artist_library")
-        .update(
-            {
-                "is_active": False,
-                "updated_at": "now()",
-            }
+        now = datetime.utcnow().isoformat()
+
+        response = (
+            supabase.table("artist_library")
+            .update(
+                {
+                    "is_active": False,
+                    "updated_at": now,
+                }
+            )
+            .eq("artist_id", artist_id)
+            .execute()
         )
-        .eq("artist_id", artist_id)
-        .execute()
-    )
 
-    return {
-        "success": True,
-        "artistId": artist_id,
-        "result": response.data,
-    }
+        return {
+            "success": True,
+            "artistId": artist_id,
+            "result": response.data,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not remove artist: {str(error)}",
+        )
 
 
 @router.post("/sync-followers")
 def sync_followers(payload: SyncFollowersRequest) -> Dict[str, Any]:
-    supabase = get_supabase()
+    try:
+        supabase = get_supabase()
 
-    today = date.today().isoformat()
-    synced = []
+        today = date.today().isoformat()
+        synced = []
 
-    for artist in payload.artists:
-        row = {
-            "artist_id": artist.artist_id,
-            "followers": artist.followers,
-            "snapshot_date": today,
+        for artist in payload.artists:
+            row = {
+                "artist_id": artist.artist_id,
+                "followers": artist.followers,
+                "snapshot_date": today,
+            }
+
+            supabase.table("artist_follower_snapshots").upsert(
+                row,
+                on_conflict="artist_id,snapshot_date",
+            ).execute()
+
+            followers_7_days = calculate_7_day_followers(
+                supabase=supabase,
+                artist_id=artist.artist_id,
+                current_followers=artist.followers,
+            )
+
+            synced.append(
+                {
+                    "artistId": artist.artist_id,
+                    "followers": artist.followers,
+                    "followers7Days": followers_7_days,
+                }
+            )
+
+        return {
+            "success": True,
+            "snapshotDate": today,
+            "artists": synced,
         }
 
-        supabase.table("artist_follower_snapshots").upsert(
-            row,
-            on_conflict="artist_id,snapshot_date",
-        ).execute()
+    except HTTPException:
+        raise
 
-        followers_7_days = calculate_7_day_followers(
-            supabase=supabase,
-            artist_id=artist.artist_id,
-            current_followers=artist.followers,
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not sync followers: {str(error)}",
         )
-
-        synced.append(
-            {
-                "artistId": artist.artist_id,
-                "followers": artist.followers,
-                "followers7Days": followers_7_days,
-            }
-        )
-
-    return {
-        "success": True,
-        "snapshotDate": today,
-        "artists": synced,
-    }
