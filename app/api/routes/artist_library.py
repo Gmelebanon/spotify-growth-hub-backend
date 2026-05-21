@@ -18,7 +18,10 @@ def get_supabase() -> Client:
         raise HTTPException(status_code=500, detail="Missing SUPABASE_URL")
 
     if not supabase_key:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_SERVICE_ROLE_KEY")
+        raise HTTPException(
+            status_code=500,
+            detail="Missing SUPABASE_SERVICE_ROLE_KEY",
+        )
 
     return create_client(supabase_url, supabase_key)
 
@@ -31,6 +34,14 @@ class ArtistCreate(BaseModel):
     genres: List[str] = []
     streams: int = 0
     growth_percent: float = Field(default=0, alias="growthPercent")
+    followers: int = 0
+    popularity: int = 0
+    total_releases: int = Field(default=0, alias="totalReleases")
+    total_tracks: int = Field(default=0, alias="totalTracks")
+    latest_release: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="latestRelease",
+    )
 
     class Config:
         populate_by_name = True
@@ -92,6 +103,7 @@ def get_artist_library() -> Dict[str, Any]:
 
         for artist in artists:
             artist_id = artist.get("artist_id")
+            current_followers = int(artist.get("followers") or 0)
 
             snapshot_response = (
                 supabase.table("artist_follower_snapshots")
@@ -104,11 +116,10 @@ def get_artist_library() -> Dict[str, Any]:
 
             snapshot_rows = snapshot_response.data or []
 
-            current_followers = (
-                int(snapshot_rows[0].get("followers") or 0)
-                if snapshot_rows
-                else 0
-            )
+            if snapshot_rows:
+                current_followers = int(
+                    snapshot_rows[0].get("followers") or current_followers
+                )
 
             followers_7_days = calculate_7_day_followers(
                 supabase=supabase,
@@ -126,7 +137,12 @@ def get_artist_library() -> Dict[str, Any]:
                     "genres": artist.get("genres") or [],
                     "streams": artist.get("streams") or 0,
                     "growthPercent": artist.get("growth_percent") or 0,
+                    "followers": current_followers,
                     "followers7Days": followers_7_days,
+                    "popularity": artist.get("popularity") or 0,
+                    "totalReleases": artist.get("total_releases") or 0,
+                    "totalTracks": artist.get("total_tracks") or 0,
+                    "latestRelease": artist.get("latest_release"),
                     "isActive": artist.get("is_active"),
                     "createdAt": artist.get("created_at"),
                     "updatedAt": artist.get("updated_at"),
@@ -152,7 +168,6 @@ def get_artist_library() -> Dict[str, Any]:
 def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
     try:
         supabase = get_supabase()
-
         now = datetime.utcnow().isoformat()
 
         artist_payload = {
@@ -163,6 +178,11 @@ def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
             "genres": payload.genres,
             "streams": payload.streams,
             "growth_percent": payload.growth_percent,
+            "followers": payload.followers,
+            "popularity": payload.popularity,
+            "total_releases": payload.total_releases,
+            "total_tracks": payload.total_tracks,
+            "latest_release": payload.latest_release,
             "is_active": True,
             "updated_at": now,
         }
@@ -172,6 +192,17 @@ def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
             .upsert(artist_payload, on_conflict="artist_id")
             .execute()
         )
+
+        snapshot_payload = {
+            "artist_id": payload.artist_id,
+            "followers": payload.followers,
+            "snapshot_date": date.today().isoformat(),
+        }
+
+        supabase.table("artist_follower_snapshots").upsert(
+            snapshot_payload,
+            on_conflict="artist_id,snapshot_date",
+        ).execute()
 
         return {
             "success": True,
@@ -192,7 +223,6 @@ def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
 def remove_artist(artist_id: str) -> Dict[str, Any]:
     try:
         supabase = get_supabase()
-
         now = datetime.utcnow().isoformat()
 
         response = (
@@ -242,6 +272,13 @@ def sync_followers(payload: SyncFollowersRequest) -> Dict[str, Any]:
                 row,
                 on_conflict="artist_id,snapshot_date",
             ).execute()
+
+            supabase.table("artist_library").update(
+                {
+                    "followers": artist.followers,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            ).eq("artist_id", artist.artist_id).execute()
 
             followers_7_days = calculate_7_day_followers(
                 supabase=supabase,
