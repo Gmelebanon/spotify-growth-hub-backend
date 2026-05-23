@@ -7,6 +7,7 @@ from app.api.routes import curation_csv_playlists
 from app.api.routes import ads_settings
 from app.api.routes import ads_filter_options
 from app.api.routes import artist_library
+from app.api.routes.song_metrics import router as song_metrics_router
 
 from app.core.database import Base, engine
 from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
@@ -46,3 +47,4 @@ app.include_router(curation_csv_playlists.router)
 app.include_router(ads_settings.router)
 app.include_router(ads_filter_options.router)
 app.include_router(artist_library.router)
+app.include_router(song_metrics_router)
