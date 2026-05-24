@@ -1,13 +1,17 @@
 import hashlib
-import os
 import secrets
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import Client, create_client
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.core.config import settings as app_settings
+from app.core.database import get_db
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -15,29 +19,12 @@ VALID_ROLES = {"admin", "viewer"}
 MASTER_USERNAME = "gmelebanon"
 
 
-def get_supabase() -> Client:
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not supabase_url:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL")
-
-    if not supabase_key:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_SERVICE_ROLE_KEY")
-
-    return create_client(supabase_url, supabase_key)
-
-
-def get_supabase_host() -> str:
-    supabase_url = os.getenv("SUPABASE_URL") or ""
-    try:
-        return urlparse(supabase_url).netloc or supabase_url
-    except Exception:
-        return "unknown"
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def is_master_username(username: Any) -> bool:
@@ -50,37 +37,44 @@ def hash_password(password: str) -> str:
     return f"sha256${salt}${digest}"
 
 
-def safe_text(value: Any) -> Optional[str]:
+def to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    try:
+        return dict(row._mapping)
+    except Exception:
+        return dict(row)
+
+
+def safe_value(value: Any) -> Optional[str]:
     if value is None:
         return None
-    text = str(value).strip()
-    return text or None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def parse_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except Exception:
-        pass
-
-    try:
-        return datetime.fromisoformat(f"{text[:10]}T00:00:00+00:00")
-    except Exception:
-        return None
-
-
-def format_display_date(value: Any) -> Optional[str]:
-    parsed = parse_datetime(value)
-    if not parsed:
-        return safe_text(value)
-    return f"{parsed.day}/{parsed.month}/{parsed.year}"
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    else:
+        text_value = str(value)
+        try:
+            parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                parsed = datetime.fromisoformat(f"{text_value[:10]}T00:00:00+00:00")
+            except Exception:
+                return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def freshness_label(value: Any) -> str:
@@ -88,11 +82,7 @@ def freshness_label(value: Any) -> str:
     if not parsed:
         return "Not synced yet"
 
-    now = datetime.now(timezone.utc)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
-    delta = now - parsed
+    delta = utc_now() - parsed
     total_seconds = max(0, int(delta.total_seconds()))
 
     if total_seconds < 60:
@@ -110,36 +100,56 @@ def freshness_label(value: Any) -> str:
     return f"{days}d ago"
 
 
-def fetch_latest_follower_history_sync(supabase: Client) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    # Primary source for Settings Last Sync.
-    try:
-        response = (
-            supabase.table("follower_history")
-            .select("date,created_at")
-            .order("date", desc=True)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
+def table_exists(db: Session, table_name: str) -> bool:
+    result = db.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_schema = 'public'
+                AND table_name = :table_name
+            ) AS exists
+            """
+        ),
+        {"table_name": table_name},
+    ).scalar()
+    return bool(result)
+
+
+def count_table(db: Session, table_name: str) -> int:
+    if not table_exists(db, table_name):
+        return 0
+    return int(db.execute(text(f'SELECT COUNT(*) FROM public."{table_name}"')).scalar() or 0)
+
+
+def get_latest_follower_history_sync(db: Session) -> Optional[Dict[str, Any]]:
+    if not table_exists(db, "follower_history"):
+        return None
+
+    row = db.execute(
+        text(
+            """
+            SELECT date, created_at
+            FROM public.follower_history
+            WHERE date IS NOT NULL OR created_at IS NOT NULL
+            ORDER BY date DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 1
+            """
         )
-        rows = response.data or []
-        if rows:
-            return rows[0], None
-    except Exception as error:
-        return None, str(error)
-
-    return None, None
+    ).first()
+    return to_dict(row) if row else None
 
 
-def normalize_account(row: Dict[str, Any], global_last_sync: Optional[str] = None) -> Dict[str, Any]:
+def normalize_account(row: Dict[str, Any], global_last_sync: Optional[Any] = None) -> Dict[str, Any]:
     name = (
         row.get("display_name")
         or row.get("name")
+        or row.get("username")
         or row.get("account")
         or row.get("account_name")
-        or row.get("username")
         or f"Account {row.get('id', '')}"
     )
-
     last_synced = (
         global_last_sync
         or row.get("last_synced_at")
@@ -147,68 +157,71 @@ def normalize_account(row: Dict[str, Any], global_last_sync: Optional[str] = Non
         or row.get("updated_at")
         or row.get("created_at")
     )
-
     status = "Connected" if row.get("is_active", True) is not False else "Disconnected"
-
     return {
-        "id": safe_text(row.get("id") or name),
-        "name": safe_text(name) or "Account",
-        "lastSynced": safe_text(last_synced),
-        "lastSyncedDisplay": format_display_date(last_synced),
+        "id": safe_value(row.get("id") or name),
+        "name": str(name),
+        "lastSynced": safe_value(last_synced),
         "status": status,
         "freshness": freshness_label(last_synced),
     }
 
 
-def get_accounts_from_spotify_accounts(supabase: Client, global_last_sync: Optional[str]) -> List[Dict[str, Any]]:
-    try:
-        response = (
-            supabase.table("spotify_accounts")
-            .select("*")
-            .order("id", desc=False)
-            .execute()
-        )
-        rows = response.data or []
-        return [normalize_account(row, global_last_sync=global_last_sync) for row in rows]
-    except Exception:
+def get_accounts_from_spotify_accounts(db: Session, global_last_sync: Optional[Any]) -> List[Dict[str, Any]]:
+    if not table_exists(db, "spotify_accounts"):
         return []
 
-
-def get_accounts_from_playlists(supabase: Client, global_last_sync: Optional[str]) -> List[Dict[str, Any]]:
-    # Fallback for projects where spotify_accounts is empty but playlists contain account names.
-    possible_columns = ["account", "account_name", "spotify_account", "owner_name"]
-
-    for column in possible_columns:
-        try:
-            response = supabase.table("playlists").select(column).execute()
-            rows = response.data or []
-            names = []
-            seen = set()
-            for row in rows:
-                name = safe_text(row.get(column))
-                if name and name.lower() not in seen:
-                    seen.add(name.lower())
-                    names.append(name)
-
-            if names:
-                return [
-                    normalize_account(
-                        {"id": f"playlist-account-{index}", "name": name, "is_active": True},
-                        global_last_sync=global_last_sync,
-                    )
-                    for index, name in enumerate(sorted(names), start=1)
-                ]
-        except Exception:
-            continue
-
-    return []
+    rows = db.execute(text("SELECT * FROM public.spotify_accounts ORDER BY id ASC")).fetchall()
+    return [normalize_account(to_dict(row), global_last_sync=global_last_sync) for row in rows]
 
 
-def get_accounts_summary(supabase: Client, global_last_sync: Optional[str] = None) -> List[Dict[str, Any]]:
-    accounts = get_accounts_from_spotify_accounts(supabase, global_last_sync)
+def get_accounts_from_playlists(db: Session, global_last_sync: Optional[Any]) -> List[Dict[str, Any]]:
+    if not table_exists(db, "playlists"):
+        return []
+
+    columns = [
+        str(row[0])
+        for row in db.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'playlists'
+                ORDER BY ordinal_position
+                """
+            )
+        ).fetchall()
+    ]
+
+    preferred_columns = ["account", "account_name", "spotify_account", "owner", "username"]
+    account_column = next((col for col in preferred_columns if col in columns), None)
+    if not account_column:
+        return []
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT DISTINCT {account_column} AS name
+            FROM public.playlists
+            WHERE {account_column} IS NOT NULL
+              AND TRIM(CAST({account_column} AS TEXT)) <> ''
+            ORDER BY {account_column} ASC
+            """
+        )
+    ).fetchall()
+
+    return [
+        normalize_account({"id": index + 1, "name": to_dict(row).get("name"), "is_active": True}, global_last_sync)
+        for index, row in enumerate(rows)
+    ]
+
+
+def get_accounts_summary(db: Session, global_last_sync: Optional[Any]) -> List[Dict[str, Any]]:
+    accounts = get_accounts_from_spotify_accounts(db, global_last_sync)
     if accounts:
         return accounts
-    return get_accounts_from_playlists(supabase, global_last_sync)
+    return get_accounts_from_playlists(db, global_last_sync)
 
 
 class CreateUserPayload(BaseModel):
@@ -235,31 +248,49 @@ class UpdateUserPayload(BaseModel):
 def serialize_user(row: Dict[str, Any]) -> Dict[str, Any]:
     username = row.get("username")
     role = row.get("role") or "viewer"
-    is_active = row.get("is_active", True)
+    is_active = row.get("is_active")
 
     if is_master_username(username):
         role = "admin"
         is_active = True
 
     return {
-        "id": row.get("id"),
+        "id": safe_value(row.get("id")),
         "username": username,
         "displayName": row.get("display_name") or username,
         "role": role,
-        "isActive": is_active,
-        "isMaster": is_master_username(username),
-        "createdAt": row.get("created_at"),
-        "updatedAt": row.get("updated_at"),
+        "isActive": True if is_active is None else bool(is_active),
+        "createdAt": safe_value(row.get("created_at")),
+        "updatedAt": safe_value(row.get("updated_at")),
     }
 
 
+def ensure_app_users_table(db: Session) -> None:
+    db.execute(
+        text(
+            """
+            CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+            CREATE TABLE IF NOT EXISTS public.app_users (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              username text NOT NULL UNIQUE,
+              display_name text,
+              password_hash text NOT NULL,
+              role text NOT NULL DEFAULT 'viewer',
+              is_active boolean NOT NULL DEFAULT true,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            """
+        )
+    )
+    db.commit()
+
+
 @router.get("/summary")
-def get_settings_summary() -> Dict[str, Any]:
+def get_settings_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-
-        latest_follower_history, follower_history_error = fetch_latest_follower_history_sync(supabase)
-
+        latest_follower_history = get_latest_follower_history_sync(db)
         latest_sync = None
         latest_sync_source = None
 
@@ -267,35 +298,28 @@ def get_settings_summary() -> Dict[str, Any]:
             latest_sync = latest_follower_history.get("date") or latest_follower_history.get("created_at")
             latest_sync_source = "follower_history"
 
-        accounts = get_accounts_summary(supabase, global_last_sync=safe_text(latest_sync))
+        accounts = get_accounts_summary(db, global_last_sync=latest_sync)
         connected_accounts = len([item for item in accounts if item.get("status") == "Connected"])
         expired_accounts = max(0, len(accounts) - connected_accounts)
         warnings = expired_accounts
 
         return {
             "success": True,
+            "source": "DATABASE_URL",
             "platformHealth": 100 if warnings == 0 else max(0, 100 - warnings * 10),
             "warnings": warnings,
             "connectedAccounts": connected_accounts,
             "expiredAccounts": expired_accounts,
             "syncSuccessRate": 100 if connected_accounts > 0 and warnings == 0 else 0,
-            "lastDataPush": safe_text(latest_sync),
-            "lastDataPushDisplay": format_display_date(latest_sync),
+            "lastDataPush": safe_value(latest_sync),
             "lastDataPushFreshness": freshness_label(latest_sync),
             "lastDataPushSource": latest_sync_source,
-            "lastSync": safe_text(latest_sync),
-            "lastSyncDisplay": format_display_date(latest_sync),
+            "lastSync": safe_value(latest_sync),
             "lastSyncFreshness": freshness_label(latest_sync),
             "lastSyncSource": latest_sync_source,
             "accounts": accounts,
-            "diagnostics": {
-                "supabaseHost": get_supabase_host(),
-                "followerHistoryError": follower_history_error,
-                "accountsSource": "spotify_accounts" if get_accounts_from_spotify_accounts(supabase, safe_text(latest_sync)) else "playlists_fallback",
-            },
             "updatedAt": utc_now_iso(),
         }
-
     except HTTPException:
         raise
     except Exception as error:
@@ -303,17 +327,23 @@ def get_settings_summary() -> Dict[str, Any]:
 
 
 @router.get("/users")
-def list_users() -> Dict[str, Any]:
+def list_users(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-        response = (
-            supabase.table("app_users")
-            .select("id,username,display_name,role,is_active,created_at,updated_at")
-            .order("created_at", desc=False)
-            .execute()
-        )
-        users = [serialize_user(row) for row in response.data or []]
-        return {"success": True, "source": "Supabase app_users", "users": users}
+        ensure_app_users_table(db)
+        rows = db.execute(
+            text(
+                """
+                SELECT id, username, display_name, role, is_active, created_at, updated_at
+                FROM public.app_users
+                ORDER BY created_at ASC
+                """
+            )
+        ).fetchall()
+        return {
+            "success": True,
+            "source": "DATABASE_URL app_users",
+            "users": [serialize_user(to_dict(row)) for row in rows],
+        }
     except HTTPException:
         raise
     except Exception as error:
@@ -321,7 +351,7 @@ def list_users() -> Dict[str, Any]:
 
 
 @router.post("/users")
-def create_user(payload: CreateUserPayload) -> Dict[str, Any]:
+def create_user(payload: CreateUserPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
     username = payload.username.strip()
     role = payload.role.strip().lower()
 
@@ -335,139 +365,171 @@ def create_user(payload: CreateUserPayload) -> Dict[str, Any]:
         role = "admin"
 
     try:
-        supabase = get_supabase()
-        now = utc_now_iso()
-        row = {
-            "username": username,
-            "display_name": payload.display_name or username,
-            "password_hash": hash_password(payload.password),
-            "role": role,
-            "is_active": True,
-            "created_at": now,
-            "updated_at": now,
-        }
-        response = supabase.table("app_users").insert(row).execute()
-        created = response.data[0] if response.data else row
-        return {"success": True, "user": serialize_user(created)}
+        ensure_app_users_table(db)
+        now = utc_now()
+        row = db.execute(
+            text(
+                """
+                INSERT INTO public.app_users (username, display_name, password_hash, role, is_active, created_at, updated_at)
+                VALUES (:username, :display_name, :password_hash, :role, true, :created_at, :updated_at)
+                ON CONFLICT (username) DO UPDATE SET
+                  display_name = EXCLUDED.display_name,
+                  password_hash = EXCLUDED.password_hash,
+                  role = EXCLUDED.role,
+                  is_active = true,
+                  updated_at = EXCLUDED.updated_at
+                RETURNING id, username, display_name, role, is_active, created_at, updated_at
+                """
+            ),
+            {
+                "username": username,
+                "display_name": payload.display_name or username,
+                "password_hash": hash_password(payload.password),
+                "role": role,
+                "created_at": now,
+                "updated_at": now,
+            },
+        ).first()
+        db.commit()
+        return {"success": True, "source": "DATABASE_URL app_users", "user": serialize_user(to_dict(row))}
     except HTTPException:
         raise
-    except Exception as error:
+    except SQLAlchemyError as error:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Could not create user: {str(error)}")
 
 
 @router.patch("/users/{user_id}")
-def update_user(user_id: str, payload: UpdateUserPayload) -> Dict[str, Any]:
-    update_payload: Dict[str, Any] = {"updated_at": utc_now_iso()}
-
-    if payload.username is not None:
-        username = payload.username.strip()
-        if not username:
-            raise HTTPException(status_code=400, detail="Username cannot be empty")
-        update_payload["username"] = username
-
-    if payload.display_name is not None:
-        update_payload["display_name"] = payload.display_name.strip() or None
-
-    if payload.role is not None:
-        role = payload.role.strip().lower()
-        if role not in VALID_ROLES:
-            raise HTTPException(status_code=400, detail="Role must be admin or viewer")
-        update_payload["role"] = role
-
-    if payload.is_active is not None:
-        update_payload["is_active"] = payload.is_active
-
-    if payload.password:
-        if len(payload.password) < 4:
-            raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-        update_payload["password_hash"] = hash_password(payload.password)
-
+def update_user(user_id: str, payload: UpdateUserPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-        existing_response = (
-            supabase.table("app_users")
-            .select("id,username,role,is_active")
-            .eq("id", user_id)
-            .limit(1)
-            .execute()
-        )
-        existing_rows = existing_response.data or []
-        existing_user = existing_rows[0] if existing_rows else {}
+        ensure_app_users_table(db)
+        existing_row = db.execute(
+            text(
+                """
+                SELECT id, username, role, is_active
+                FROM public.app_users
+                WHERE id::text = :user_id
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id},
+        ).first()
+        if not existing_row:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        existing_user = to_dict(existing_row)
+        update_fields: Dict[str, Any] = {"updated_at": utc_now()}
+
+        if payload.username is not None:
+            username = payload.username.strip()
+            if not username:
+                raise HTTPException(status_code=400, detail="Username cannot be empty")
+            update_fields["username"] = username
+
+        if payload.display_name is not None:
+            update_fields["display_name"] = payload.display_name.strip() or None
+
+        if payload.role is not None:
+            role = payload.role.strip().lower()
+            if role not in VALID_ROLES:
+                raise HTTPException(status_code=400, detail="Role must be admin or viewer")
+            update_fields["role"] = role
+
+        if payload.is_active is not None:
+            update_fields["is_active"] = payload.is_active
+
+        if payload.password:
+            if len(payload.password) < 4:
+                raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+            update_fields["password_hash"] = hash_password(payload.password)
 
         if is_master_username(existing_user.get("username")):
-            update_payload.pop("role", None)
-            update_payload.pop("is_active", None)
-            update_payload.pop("username", None)
+            update_fields.pop("role", None)
+            update_fields.pop("is_active", None)
+            update_fields["role"] = "admin"
+            update_fields["is_active"] = True
 
-        response = (
-            supabase.table("app_users")
-            .update(update_payload)
-            .eq("id", user_id)
-            .execute()
-        )
-        updated = response.data[0] if response.data else {"id": user_id, **existing_user, **update_payload}
-        return {"success": True, "user": serialize_user(updated)}
+        assignments = ", ".join([f"{key} = :{key}" for key in update_fields.keys()])
+        params = {**update_fields, "user_id": user_id}
+        updated_row = db.execute(
+            text(
+                f"""
+                UPDATE public.app_users
+                SET {assignments}
+                WHERE id::text = :user_id
+                RETURNING id, username, display_name, role, is_active, created_at, updated_at
+                """
+            ),
+            params,
+        ).first()
+        db.commit()
+        return {"success": True, "source": "DATABASE_URL app_users", "user": serialize_user(to_dict(updated_row))}
     except HTTPException:
         raise
-    except Exception as error:
+    except SQLAlchemyError as error:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Could not update user: {str(error)}")
 
 
 @router.delete("/users/{user_id}")
-def delete_user(user_id: str) -> Dict[str, Any]:
+def delete_user(user_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-        existing_response = (
-            supabase.table("app_users")
-            .select("id,username")
-            .eq("id", user_id)
-            .limit(1)
-            .execute()
-        )
-        existing_rows = existing_response.data or []
+        ensure_app_users_table(db)
+        existing_row = db.execute(
+            text(
+                """
+                SELECT id, username
+                FROM public.app_users
+                WHERE id::text = :user_id
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id},
+        ).first()
+        if not existing_row:
+            raise HTTPException(status_code=404, detail="User not found")
 
-        if existing_rows and is_master_username(existing_rows[0].get("username")):
+        existing_user = to_dict(existing_row)
+        if is_master_username(existing_user.get("username")):
             raise HTTPException(status_code=400, detail="Master account cannot be deleted")
 
-        response = (
-            supabase.table("app_users")
-            .delete()
-            .eq("id", user_id)
-            .execute()
-        )
-        return {"success": True, "deletedUserId": user_id, "result": response.data or []}
+        db.execute(text("DELETE FROM public.app_users WHERE id::text = :user_id"), {"user_id": user_id})
+        db.commit()
+        return {"success": True, "source": "DATABASE_URL app_users", "deletedUserId": user_id}
     except HTTPException:
         raise
-    except Exception as error:
+    except SQLAlchemyError as error:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Could not delete user: {str(error)}")
 
 
 @router.get("/debug")
-def debug_settings() -> Dict[str, Any]:
-    try:
-        supabase = get_supabase()
-        debug: Dict[str, Any] = {
-            "success": True,
-            "supabaseHost": get_supabase_host(),
-            "updatedAt": utc_now_iso(),
-        }
+def settings_debug(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    database_url = getattr(app_settings, "DATABASE_URL", "") or ""
+    parsed = urlparse(database_url)
 
-        for table_name in ["app_users", "follower_history", "spotify_accounts", "playlists"]:
-            try:
-                response = supabase.table(table_name).select("*", count="exact").limit(1).execute()
-                debug[table_name] = {
-                    "count": getattr(response, "count", None),
-                    "sample": (response.data or [None])[0],
-                }
-            except Exception as error:
-                debug[table_name] = {"error": str(error)}
+    latest_follower_history = get_latest_follower_history_sync(db)
 
-        latest_follower_history, error = fetch_latest_follower_history_sync(supabase)
-        debug["latestFollowerHistory"] = latest_follower_history
-        debug["latestFollowerHistoryError"] = error
+    debug_tables = {}
+    for table_name in ["app_users", "follower_history", "spotify_accounts", "playlists"]:
+        try:
+            debug_tables[table_name] = {
+                "exists": table_exists(db, table_name),
+                "count": count_table(db, table_name),
+            }
+        except Exception as error:
+            debug_tables[table_name] = {
+                "exists": False,
+                "count": 0,
+                "error": str(error),
+            }
 
-        return debug
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Settings debug error: {str(error)}")
+    return {
+        "success": True,
+        "source": "DATABASE_URL",
+        "databaseHost": parsed.hostname,
+        "databaseName": parsed.path.lstrip("/") if parsed.path else None,
+        "updatedAt": utc_now_iso(),
+        "tables": debug_tables,
+        "latestFollowerHistory": latest_follower_history,
+    }
