@@ -250,15 +250,30 @@ def calculate_7_day_followers(
     artist_id: str,
     current_followers: int,
 ) -> int:
-    seven_days_ago = date.today() - timedelta(days=7)
+    """
+    Calculate follower growth from available snapshots in the last 7 days.
+
+    Example:
+    Synora has:
+    2026-05-24 = 37
+    2026-05-23 = 35
+    2026-05-22 = 35
+    2026-05-21 = 35
+
+    Result:
+    37 - 35 = +2
+    """
+    today = date.today()
+    seven_days_ago = today - timedelta(days=7)
 
     response = (
         supabase.table("artist_follower_snapshots")
-        .select("followers")
+        .select("followers,snapshot_date,created_at")
         .eq("artist_id", artist_id)
-        .lte("snapshot_date", seven_days_ago.isoformat())
-        .order("snapshot_date", desc=True)
-        .limit(1)
+        .gte("snapshot_date", seven_days_ago.isoformat())
+        .lte("snapshot_date", today.isoformat())
+        .order("snapshot_date", desc=False)
+        .order("created_at", desc=False)
         .execute()
     )
 
@@ -267,8 +282,27 @@ def calculate_7_day_followers(
     if not rows:
         return 0
 
-    previous_followers = int(rows[0].get("followers") or 0)
-    return int(current_followers) - previous_followers
+    valid_rows = []
+
+    for row in rows:
+        try:
+            valid_rows.append(
+                {
+                    "followers": int(row.get("followers") or 0),
+                    "snapshot_date": row.get("snapshot_date"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+        except Exception:
+            continue
+
+    if not valid_rows:
+        return 0
+
+    oldest_followers = valid_rows[0]["followers"]
+    latest_followers = int(current_followers or 0)
+
+    return latest_followers - oldest_followers
 
 
 @router.get("")
@@ -293,9 +327,10 @@ def get_artist_library() -> Dict[str, Any]:
 
             snapshot_response = (
                 supabase.table("artist_follower_snapshots")
-                .select("followers")
+                .select("followers,created_at")
                 .eq("artist_id", artist_id)
                 .eq("snapshot_date", date.today().isoformat())
+                .order("created_at", desc=True)
                 .limit(1)
                 .execute()
             )
