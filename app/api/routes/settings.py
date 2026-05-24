@@ -2,14 +2,14 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
-
 
 VALID_ROLES = {"admin", "viewer"}
 MASTER_USERNAME = "gmelebanon"
@@ -28,6 +28,14 @@ def get_supabase() -> Client:
     return create_client(supabase_url, supabase_key)
 
 
+def get_supabase_host() -> str:
+    supabase_url = os.getenv("SUPABASE_URL") or ""
+    try:
+        return urlparse(supabase_url).netloc or supabase_url
+    except Exception:
+        return "unknown"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -42,23 +50,37 @@ def hash_password(password: str) -> str:
     return f"sha256${salt}${digest}"
 
 
-def safe_iso(value: Any) -> Optional[str]:
+def safe_text(value: Any) -> Optional[str]:
     if value is None:
         return None
-    return str(value)
+    text = str(value).strip()
+    return text or None
 
 
 def parse_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
-    text = str(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except Exception:
-        try:
-            return datetime.fromisoformat(f"{text}T00:00:00+00:00")
-        except Exception:
-            return None
+        pass
+
+    try:
+        return datetime.fromisoformat(f"{text[:10]}T00:00:00+00:00")
+    except Exception:
+        return None
+
+
+def format_display_date(value: Any) -> Optional[str]:
+    parsed = parse_datetime(value)
+    if not parsed:
+        return safe_text(value)
+    return f"{parsed.day}/{parsed.month}/{parsed.year}"
 
 
 def freshness_label(value: Any) -> str:
@@ -88,27 +110,8 @@ def freshness_label(value: Any) -> str:
     return f"{days}d ago"
 
 
-def get_latest_table_push(supabase: Client, table_name: str) -> Optional[Dict[str, Any]]:
-    # Most project tables use created_at. follower_history also has date.
-    try:
-        response = (
-            supabase.table(table_name)
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = response.data or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
-
-
-
-
-def get_latest_follower_history_sync(supabase: Client) -> Optional[Dict[str, Any]]:
-    # Settings Last Sync must come from follower_history date first, because imported
-    # history rows can have a fresh data date even when created_at differs.
+def fetch_latest_follower_history_sync(supabase: Client) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    # Primary source for Settings Last Sync.
     try:
         response = (
             supabase.table("follower_history")
@@ -119,17 +122,24 @@ def get_latest_follower_history_sync(supabase: Client) -> Optional[Dict[str, Any
             .execute()
         )
         rows = response.data or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
+        if rows:
+            return rows[0], None
+    except Exception as error:
+        return None, str(error)
+
+    return None, None
+
 
 def normalize_account(row: Dict[str, Any], global_last_sync: Optional[str] = None) -> Dict[str, Any]:
     name = (
         row.get("display_name")
         or row.get("name")
+        or row.get("account")
+        or row.get("account_name")
         or row.get("username")
         or f"Account {row.get('id', '')}"
     )
+
     last_synced = (
         global_last_sync
         or row.get("last_synced_at")
@@ -137,17 +147,20 @@ def normalize_account(row: Dict[str, Any], global_last_sync: Optional[str] = Non
         or row.get("updated_at")
         or row.get("created_at")
     )
+
     status = "Connected" if row.get("is_active", True) is not False else "Disconnected"
+
     return {
-        "id": row.get("id"),
-        "name": name,
-        "lastSynced": safe_iso(last_synced),
+        "id": safe_text(row.get("id") or name),
+        "name": safe_text(name) or "Account",
+        "lastSynced": safe_text(last_synced),
+        "lastSyncedDisplay": format_display_date(last_synced),
         "status": status,
         "freshness": freshness_label(last_synced),
     }
 
 
-def get_accounts_summary(supabase: Client, global_last_sync: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_accounts_from_spotify_accounts(supabase: Client, global_last_sync: Optional[str]) -> List[Dict[str, Any]]:
     try:
         response = (
             supabase.table("spotify_accounts")
@@ -159,6 +172,43 @@ def get_accounts_summary(supabase: Client, global_last_sync: Optional[str] = Non
         return [normalize_account(row, global_last_sync=global_last_sync) for row in rows]
     except Exception:
         return []
+
+
+def get_accounts_from_playlists(supabase: Client, global_last_sync: Optional[str]) -> List[Dict[str, Any]]:
+    # Fallback for projects where spotify_accounts is empty but playlists contain account names.
+    possible_columns = ["account", "account_name", "spotify_account", "owner_name"]
+
+    for column in possible_columns:
+        try:
+            response = supabase.table("playlists").select(column).execute()
+            rows = response.data or []
+            names = []
+            seen = set()
+            for row in rows:
+                name = safe_text(row.get(column))
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    names.append(name)
+
+            if names:
+                return [
+                    normalize_account(
+                        {"id": f"playlist-account-{index}", "name": name, "is_active": True},
+                        global_last_sync=global_last_sync,
+                    )
+                    for index, name in enumerate(sorted(names), start=1)
+                ]
+        except Exception:
+            continue
+
+    return []
+
+
+def get_accounts_summary(supabase: Client, global_last_sync: Optional[str] = None) -> List[Dict[str, Any]]:
+    accounts = get_accounts_from_spotify_accounts(supabase, global_last_sync)
+    if accounts:
+        return accounts
+    return get_accounts_from_playlists(supabase, global_last_sync)
 
 
 class CreateUserPayload(BaseModel):
@@ -183,12 +233,21 @@ class UpdateUserPayload(BaseModel):
 
 
 def serialize_user(row: Dict[str, Any]) -> Dict[str, Any]:
+    username = row.get("username")
+    role = row.get("role") or "viewer"
+    is_active = row.get("is_active", True)
+
+    if is_master_username(username):
+        role = "admin"
+        is_active = True
+
     return {
         "id": row.get("id"),
-        "username": row.get("username"),
-        "displayName": row.get("display_name"),
-        "role": row.get("role") or "viewer",
-        "isActive": row.get("is_active", True),
+        "username": username,
+        "displayName": row.get("display_name") or username,
+        "role": role,
+        "isActive": is_active,
+        "isMaster": is_master_username(username),
         "createdAt": row.get("created_at"),
         "updatedAt": row.get("updated_at"),
     }
@@ -199,20 +258,16 @@ def get_settings_summary() -> Dict[str, Any]:
     try:
         supabase = get_supabase()
 
-        latest_follower_history = get_latest_follower_history_sync(supabase)
+        latest_follower_history, follower_history_error = fetch_latest_follower_history_sync(supabase)
 
-        latest_data_push = None
-        latest_data_push_source = None
+        latest_sync = None
+        latest_sync_source = None
 
         if latest_follower_history:
-            latest_data_push = (
-                latest_follower_history.get("date")
-                or latest_follower_history.get("created_at")
-            )
-            latest_data_push_source = "follower_history"
+            latest_sync = latest_follower_history.get("date") or latest_follower_history.get("created_at")
+            latest_sync_source = "follower_history"
 
-        accounts = get_accounts_summary(supabase, global_last_sync=safe_iso(latest_data_push))
-
+        accounts = get_accounts_summary(supabase, global_last_sync=safe_text(latest_sync))
         connected_accounts = len([item for item in accounts if item.get("status") == "Connected"])
         expired_accounts = max(0, len(accounts) - connected_accounts)
         warnings = expired_accounts
@@ -224,13 +279,20 @@ def get_settings_summary() -> Dict[str, Any]:
             "connectedAccounts": connected_accounts,
             "expiredAccounts": expired_accounts,
             "syncSuccessRate": 100 if connected_accounts > 0 and warnings == 0 else 0,
-            "lastDataPush": safe_iso(latest_data_push),
-            "lastDataPushFreshness": freshness_label(latest_data_push),
-            "lastDataPushSource": latest_data_push_source,
-            "lastSync": safe_iso(latest_data_push),
-            "lastSyncFreshness": freshness_label(latest_data_push),
-            "lastSyncSource": latest_data_push_source,
+            "lastDataPush": safe_text(latest_sync),
+            "lastDataPushDisplay": format_display_date(latest_sync),
+            "lastDataPushFreshness": freshness_label(latest_sync),
+            "lastDataPushSource": latest_sync_source,
+            "lastSync": safe_text(latest_sync),
+            "lastSyncDisplay": format_display_date(latest_sync),
+            "lastSyncFreshness": freshness_label(latest_sync),
+            "lastSyncSource": latest_sync_source,
             "accounts": accounts,
+            "diagnostics": {
+                "supabaseHost": get_supabase_host(),
+                "followerHistoryError": follower_history_error,
+                "accountsSource": "spotify_accounts" if get_accounts_from_spotify_accounts(supabase, safe_text(latest_sync)) else "playlists_fallback",
+            },
             "updatedAt": utc_now_iso(),
         }
 
@@ -250,7 +312,8 @@ def list_users() -> Dict[str, Any]:
             .order("created_at", desc=False)
             .execute()
         )
-        return {"success": True, "users": [serialize_user(row) for row in response.data or []]}
+        users = [serialize_user(row) for row in response.data or []]
+        return {"success": True, "source": "Supabase app_users", "users": users}
     except HTTPException:
         raise
     except Exception as error:
@@ -332,9 +395,9 @@ def update_user(user_id: str, payload: UpdateUserPayload) -> Dict[str, Any]:
         existing_user = existing_rows[0] if existing_rows else {}
 
         if is_master_username(existing_user.get("username")):
-            # Master account is always admin and active. Password can still be changed.
             update_payload.pop("role", None)
             update_payload.pop("is_active", None)
+            update_payload.pop("username", None)
 
         response = (
             supabase.table("app_users")
@@ -342,7 +405,7 @@ def update_user(user_id: str, payload: UpdateUserPayload) -> Dict[str, Any]:
             .eq("id", user_id)
             .execute()
         )
-        updated = response.data[0] if response.data else {"id": user_id, **update_payload}
+        updated = response.data[0] if response.data else {"id": user_id, **existing_user, **update_payload}
         return {"success": True, "user": serialize_user(updated)}
     except HTTPException:
         raise
@@ -362,6 +425,7 @@ def delete_user(user_id: str) -> Dict[str, Any]:
             .execute()
         )
         existing_rows = existing_response.data or []
+
         if existing_rows and is_master_username(existing_rows[0].get("username")):
             raise HTTPException(status_code=400, detail="Master account cannot be deleted")
 
@@ -376,3 +440,34 @@ def delete_user(user_id: str) -> Dict[str, Any]:
         raise
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Could not delete user: {str(error)}")
+
+
+@router.get("/debug")
+def debug_settings() -> Dict[str, Any]:
+    try:
+        supabase = get_supabase()
+        debug: Dict[str, Any] = {
+            "success": True,
+            "supabaseHost": get_supabase_host(),
+            "updatedAt": utc_now_iso(),
+        }
+
+        for table_name in ["app_users", "follower_history", "spotify_accounts", "playlists"]:
+            try:
+                response = supabase.table(table_name).select("*", count="exact").limit(1).execute()
+                debug[table_name] = {
+                    "count": getattr(response, "count", None),
+                    "sample": (response.data or [None])[0],
+                }
+            except Exception as error:
+                debug[table_name] = {"error": str(error)}
+
+        latest_follower_history, error = fetch_latest_follower_history_sync(supabase)
+        debug["latestFollowerHistory"] = latest_follower_history
+        debug["latestFollowerHistoryError"] = error
+
+        return debug
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Settings debug error: {str(error)}")
