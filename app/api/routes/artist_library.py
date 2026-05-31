@@ -1,28 +1,22 @@
 import base64
+import json
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import Client, create_client
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
 
 
 router = APIRouter(prefix="/api/artist-library", tags=["artist-library"])
 
-
-def get_supabase() -> Client:
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not supabase_url:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL")
-
-    if not supabase_key:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_SERVICE_ROLE_KEY")
-
-    return create_client(supabase_url, supabase_key)
+GROWTH_LOGIC_VERSION = "database-url-batched-v1"
 
 
 class ArtistCreate(BaseModel):
@@ -56,10 +50,46 @@ class SyncFollowersRequest(BaseModel):
     artists: List[ArtistFollowerSnapshotIn]
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    try:
+        return dict(row._mapping)
+    except Exception:
+        return dict(row)
+
+
+def as_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value if value is not None else fallback)
+    except Exception:
+        return fallback
+
+
+def json_param(value: Any) -> str:
+    return json.dumps(value if value is not None else None, ensure_ascii=False)
+
+
+def normalize_json_value(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return value
+
+
 def get_best_image(images: Any) -> Optional[str]:
     if not isinstance(images, list) or len(images) == 0:
         return None
-
     first_image = images[0] or {}
     return first_image.get("url")
 
@@ -74,12 +104,10 @@ def format_duration(ms: int) -> str:
 def get_release_days_ago(release_date: Optional[str]) -> Optional[int]:
     if not release_date:
         return None
-
     try:
         release_day = date.fromisoformat(release_date[:10])
     except ValueError:
         return None
-
     return (date.today() - release_day).days
 
 
@@ -111,8 +139,7 @@ def get_spotify_access_token() -> str:
             detail=f"Spotify token request failed: {response.text}",
         )
 
-    data = response.json()
-    return data["access_token"]
+    return response.json()["access_token"]
 
 
 def spotify_get(url: str, access_token: str) -> Dict[str, Any]:
@@ -138,7 +165,6 @@ def get_album_tracks(album_id: str, access_token: str) -> List[Dict[str, Any]]:
     )
 
     tracks = []
-
     for track in tracks_data.get("items") or []:
         track_id = track.get("id")
         tracks.append(
@@ -159,7 +185,6 @@ def get_album_tracks(album_id: str, access_token: str) -> List[Dict[str, Any]]:
                 ),
             }
         )
-
     return tracks
 
 
@@ -199,7 +224,6 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
     )
 
     unique_releases: Dict[str, Dict[str, Any]] = {}
-
     for release in albums_data.get("items") or []:
         release_id = release.get("id")
         if release_id and release_id not in unique_releases:
@@ -220,10 +244,7 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
             recent_raw_releases.append(release)
 
     latest_release = normalize_release(releases[0], access_token) if releases else None
-    recent_releases = [
-        normalize_release(release, access_token)
-        for release in recent_raw_releases
-    ]
+    recent_releases = [normalize_release(release, access_token) for release in recent_raw_releases]
 
     artist_spotify_url = (
         (artist_data.get("external_urls") or {}).get("spotify")
@@ -245,352 +266,421 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
     }
 
 
-def calculate_7_day_followers(
-    supabase: Client,
-    artist_id: str,
-    current_followers: int,
-) -> int:
-    """
-    Calculate follower growth from available snapshots in the last 7 days.
+def calculate_growth_from_snapshot_rows(snapshot_rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Return {artist_id: 7-day growth} using one batched snapshot result."""
+    grouped: Dict[str, Dict[date, Dict[str, Any]]] = {}
 
-    Example:
-    Synora has:
-    2026-05-24 = 37
-    2026-05-23 = 35
-    2026-05-22 = 35
-    2026-05-21 = 35
+    for row in snapshot_rows:
+        artist_id = str(row.get("artist_id") or "")
+        raw_snapshot_date = row.get("snapshot_date")
+        if not artist_id or not raw_snapshot_date:
+            continue
 
-    Result:
-    37 - 35 = +2
-    """
-    today = date.today()
-    seven_days_ago = today - timedelta(days=7)
-
-    response = (
-        supabase.table("artist_follower_snapshots")
-        .select("followers,snapshot_date,created_at")
-        .eq("artist_id", artist_id)
-        .gte("snapshot_date", seven_days_ago.isoformat())
-        .lte("snapshot_date", today.isoformat())
-        .order("snapshot_date", desc=False)
-        .order("created_at", desc=False)
-        .execute()
-    )
-
-    rows = response.data or []
-
-    if not rows:
-        return 0
-
-    valid_rows = []
-
-    for row in rows:
         try:
-            valid_rows.append(
-                {
-                    "followers": int(row.get("followers") or 0),
-                    "snapshot_date": row.get("snapshot_date"),
-                    "created_at": row.get("created_at"),
-                }
+            snapshot_day = (
+                raw_snapshot_date
+                if isinstance(raw_snapshot_date, date)
+                else date.fromisoformat(str(raw_snapshot_date)[:10])
             )
+            followers = as_int(row.get("followers"), 0)
         except Exception:
             continue
 
-    if not valid_rows:
-        return 0
+        by_day = grouped.setdefault(artist_id, {})
+        existing = by_day.get(snapshot_day)
+        normalized = {
+            "followers": followers,
+            "snapshot_date": snapshot_day,
+            "created_at": row.get("created_at"),
+        }
+        if existing is None or str(normalized.get("created_at") or "") >= str(existing.get("created_at") or ""):
+            by_day[snapshot_day] = normalized
 
-    oldest_followers = valid_rows[0]["followers"]
-    latest_followers = int(current_followers or 0)
+    growth_by_artist: Dict[str, int] = {}
 
-    return latest_followers - oldest_followers
+    for artist_id, by_day in grouped.items():
+        if not by_day:
+            growth_by_artist[artist_id] = 0
+            continue
+
+        latest_day = max(by_day.keys())
+        window_start = latest_day - timedelta(days=7)
+        eligible_days = [day for day in by_day.keys() if window_start <= day <= latest_day]
+        if not eligible_days:
+            growth_by_artist[artist_id] = 0
+            continue
+
+        oldest_day = min(eligible_days)
+        latest_followers = as_int(by_day[latest_day].get("followers"), 0)
+        oldest_followers = as_int(by_day[oldest_day].get("followers"), 0)
+        growth_by_artist[artist_id] = latest_followers - oldest_followers
+
+    return growth_by_artist
+
+
+def get_artist_snapshot_data(db: Session, artist_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    if not artist_ids:
+        return {}
+
+    rows = db.execute(
+        text(
+            """
+            SELECT artist_id, followers, snapshot_date, created_at
+            FROM public.artist_follower_snapshots
+            WHERE artist_id = ANY(:artist_ids)
+            ORDER BY artist_id ASC, snapshot_date ASC, created_at ASC
+            """
+        ),
+        {"artist_ids": artist_ids},
+    ).fetchall()
+
+    snapshot_rows = [to_dict(row) for row in rows]
+    growth_by_artist = calculate_growth_from_snapshot_rows(snapshot_rows)
+
+    latest_followers_by_artist: Dict[str, int] = {}
+    latest_key_by_artist: Dict[str, str] = {}
+
+    for row in snapshot_rows:
+        artist_id = str(row.get("artist_id") or "")
+        snapshot_date = row.get("snapshot_date")
+        created_at = row.get("created_at")
+        if not artist_id or not snapshot_date:
+            continue
+        sort_key = f"{str(snapshot_date)[:10]}|{created_at or ''}"
+        if sort_key >= latest_key_by_artist.get(artist_id, ""):
+            latest_key_by_artist[artist_id] = sort_key
+            latest_followers_by_artist[artist_id] = as_int(row.get("followers"), 0)
+
+    return {
+        artist_id: {
+            "followers": latest_followers_by_artist.get(artist_id, 0),
+            "followers7Days": growth_by_artist.get(artist_id, 0),
+        }
+        for artist_id in artist_ids
+    }
+
+
+def serialize_artist(row: Dict[str, Any], snapshot_data: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    artist_id = row.get("artist_id")
+    snapshot_data = snapshot_data or {}
+    current_followers = snapshot_data.get("followers") or as_int(row.get("followers"), 0)
+
+    return {
+        "id": artist_id,
+        "artistId": artist_id,
+        "name": row.get("name"),
+        "spotifyUrl": row.get("spotify_url"),
+        "image": row.get("image_url"),
+        "genres": normalize_json_value(row.get("genres"), []),
+        "streams": as_int(row.get("streams"), 0),
+        "growthPercent": float(row.get("growth_percent") or 0),
+        "followers": current_followers,
+        "followers7Days": as_int(snapshot_data.get("followers7Days"), 0),
+        "popularity": as_int(row.get("popularity"), 0),
+        "totalReleases": as_int(row.get("total_releases"), 0),
+        "totalTracks": as_int(row.get("total_tracks"), 0),
+        "latestRelease": normalize_json_value(row.get("latest_release"), None),
+        "recentReleases": normalize_json_value(row.get("recent_releases"), []),
+        "isActive": row.get("is_active"),
+        "createdAt": str(row.get("created_at")) if row.get("created_at") is not None else None,
+        "updatedAt": str(row.get("updated_at")) if row.get("updated_at") is not None else None,
+    }
 
 
 @router.get("")
-def get_artist_library() -> Dict[str, Any]:
+def get_artist_library(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-
-        response = (
-            supabase.table("artist_library")
-            .select("*")
-            .eq("is_active", True)
-            .order("created_at", desc=False)
-            .execute()
-        )
-
-        artists = response.data or []
-        enriched_artists = []
-
-        for artist in artists:
-            artist_id = artist.get("artist_id")
-            current_followers = int(artist.get("followers") or 0)
-
-            snapshot_response = (
-                supabase.table("artist_follower_snapshots")
-                .select("followers,created_at")
-                .eq("artist_id", artist_id)
-                .eq("snapshot_date", date.today().isoformat())
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
+        rows = db.execute(
+            text(
+                """
+                SELECT *
+                FROM public.artist_library
+                WHERE is_active IS TRUE
+                ORDER BY created_at ASC NULLS LAST
+                """
             )
+        ).fetchall()
 
-            snapshot_rows = snapshot_response.data or []
-
-            if snapshot_rows:
-                current_followers = int(
-                    snapshot_rows[0].get("followers") or current_followers
-                )
-
-            followers_7_days = calculate_7_day_followers(
-                supabase=supabase,
-                artist_id=artist_id,
-                current_followers=current_followers,
-            )
-
-            enriched_artists.append(
-                {
-                    "id": artist_id,
-                    "artistId": artist_id,
-                    "name": artist.get("name"),
-                    "spotifyUrl": artist.get("spotify_url"),
-                    "image": artist.get("image_url"),
-                    "genres": artist.get("genres") or [],
-                    "streams": artist.get("streams") or 0,
-                    "growthPercent": artist.get("growth_percent") or 0,
-                    "followers": current_followers,
-                    "followers7Days": followers_7_days,
-                    "popularity": artist.get("popularity") or 0,
-                    "totalReleases": artist.get("total_releases") or 0,
-                    "totalTracks": artist.get("total_tracks") or 0,
-                    "latestRelease": artist.get("latest_release"),
-                    "recentReleases": artist.get("recent_releases") or [],
-                    "isActive": artist.get("is_active"),
-                    "createdAt": artist.get("created_at"),
-                    "updatedAt": artist.get("updated_at"),
-                }
-            )
+        artists = [to_dict(row) for row in rows]
+        artist_ids = [str(artist.get("artist_id")) for artist in artists if artist.get("artist_id")]
+        snapshot_by_artist = get_artist_snapshot_data(db, artist_ids)
 
         return {
             "success": True,
-            "artists": enriched_artists,
+            "source": "DATABASE_URL",
+            "growthLogicVersion": GROWTH_LOGIC_VERSION,
+            "artists": [
+                serialize_artist(artist, snapshot_by_artist.get(str(artist.get("artist_id"))))
+                for artist in artists
+            ],
         }
-
-    except HTTPException:
-        raise
-
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Artist library database error: {str(error)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Artist library database error: {str(error)}")
 
 
 @router.post("")
-def add_artist(payload: ArtistCreate) -> Dict[str, Any]:
+def add_artist(payload: ArtistCreate, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-        now = datetime.utcnow().isoformat()
+        now = utc_now()
+        today = date.today()
 
-        artist_payload = {
-            "artist_id": payload.artist_id,
-            "name": payload.name,
-            "spotify_url": payload.spotify_url,
-            "image_url": payload.image_url,
-            "genres": payload.genres,
-            "streams": payload.streams,
-            "growth_percent": payload.growth_percent,
-            "followers": payload.followers,
-            "popularity": payload.popularity,
-            "total_releases": payload.total_releases,
-            "total_tracks": payload.total_tracks,
-            "latest_release": payload.latest_release,
-            "recent_releases": payload.recent_releases,
-            "is_active": True,
-            "updated_at": now,
-        }
+        row = db.execute(
+            text(
+                """
+                INSERT INTO public.artist_library (
+                  artist_id, name, spotify_url, image_url, genres, streams, growth_percent,
+                  followers, popularity, total_releases, total_tracks, latest_release,
+                  recent_releases, is_active, updated_at
+                )
+                VALUES (
+                  :artist_id, :name, :spotify_url, :image_url, CAST(:genres AS jsonb), :streams,
+                  :growth_percent, :followers, :popularity, :total_releases, :total_tracks,
+                  CAST(:latest_release AS jsonb), CAST(:recent_releases AS jsonb), true, :updated_at
+                )
+                ON CONFLICT (artist_id) DO UPDATE SET
+                  name = EXCLUDED.name,
+                  spotify_url = EXCLUDED.spotify_url,
+                  image_url = EXCLUDED.image_url,
+                  genres = EXCLUDED.genres,
+                  streams = EXCLUDED.streams,
+                  growth_percent = EXCLUDED.growth_percent,
+                  followers = EXCLUDED.followers,
+                  popularity = EXCLUDED.popularity,
+                  total_releases = EXCLUDED.total_releases,
+                  total_tracks = EXCLUDED.total_tracks,
+                  latest_release = EXCLUDED.latest_release,
+                  recent_releases = EXCLUDED.recent_releases,
+                  is_active = true,
+                  updated_at = EXCLUDED.updated_at
+                RETURNING *
+                """
+            ),
+            {
+                "artist_id": payload.artist_id,
+                "name": payload.name,
+                "spotify_url": payload.spotify_url,
+                "image_url": payload.image_url,
+                "genres": json_param(payload.genres),
+                "streams": payload.streams,
+                "growth_percent": payload.growth_percent,
+                "followers": payload.followers,
+                "popularity": payload.popularity,
+                "total_releases": payload.total_releases,
+                "total_tracks": payload.total_tracks,
+                "latest_release": json_param(payload.latest_release),
+                "recent_releases": json_param(payload.recent_releases),
+                "updated_at": now,
+            },
+        ).first()
 
-        response = (
-            supabase.table("artist_library")
-            .upsert(artist_payload, on_conflict="artist_id")
-            .execute()
+        db.execute(
+            text(
+                """
+                INSERT INTO public.artist_follower_snapshots (artist_id, followers, snapshot_date, created_at)
+                VALUES (:artist_id, :followers, :snapshot_date, :created_at)
+                ON CONFLICT (artist_id, snapshot_date) DO UPDATE SET
+                  followers = EXCLUDED.followers,
+                  created_at = EXCLUDED.created_at
+                """
+            ),
+            {
+                "artist_id": payload.artist_id,
+                "followers": payload.followers,
+                "snapshot_date": today,
+                "created_at": now,
+            },
         )
 
-        snapshot_payload = {
-            "artist_id": payload.artist_id,
-            "followers": payload.followers,
-            "snapshot_date": date.today().isoformat(),
-        }
-
-        supabase.table("artist_follower_snapshots").upsert(
-            snapshot_payload,
-            on_conflict="artist_id,snapshot_date",
-        ).execute()
-
-        return {
-            "success": True,
-            "artist": response.data[0] if response.data else artist_payload,
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not add artist: {str(error)}",
-        )
+        db.commit()
+        artist = to_dict(row)
+        return {"success": True, "source": "DATABASE_URL", "artist": serialize_artist(artist)}
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not add artist: {str(error)}")
 
 
 @router.delete("/{artist_id}")
-def remove_artist(artist_id: str) -> Dict[str, Any]:
+def remove_artist(artist_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-        now = datetime.utcnow().isoformat()
-
-        response = (
-            supabase.table("artist_library")
-            .update(
-                {
-                    "is_active": False,
-                    "updated_at": now,
-                }
-            )
-            .eq("artist_id", artist_id)
-            .execute()
-        )
-
+        row = db.execute(
+            text(
+                """
+                UPDATE public.artist_library
+                SET is_active = false, updated_at = :updated_at
+                WHERE artist_id = :artist_id
+                RETURNING *
+                """
+            ),
+            {"artist_id": artist_id, "updated_at": utc_now()},
+        ).first()
+        db.commit()
         return {
             "success": True,
+            "source": "DATABASE_URL",
             "artistId": artist_id,
-            "result": response.data,
+            "result": serialize_artist(to_dict(row)) if row else None,
         }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not remove artist: {str(error)}",
-        )
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not remove artist: {str(error)}")
 
 
 @router.post("/sync-followers")
-def sync_followers(payload: SyncFollowersRequest) -> Dict[str, Any]:
+def sync_followers(payload: SyncFollowersRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
+        now = utc_now()
+        today = date.today()
+        artists = payload.artists or []
 
-        today = date.today().isoformat()
-        synced = []
-
-        for artist in payload.artists:
-            row = {
-                "artist_id": artist.artist_id,
-                "followers": artist.followers,
-                "snapshot_date": today,
+        if not artists:
+            return {
+                "success": True,
+                "source": "DATABASE_URL",
+                "growthLogicVersion": GROWTH_LOGIC_VERSION,
+                "snapshotDate": today.isoformat(),
+                "artists": [],
             }
 
-            supabase.table("artist_follower_snapshots").upsert(
-                row,
-                on_conflict="artist_id,snapshot_date",
-            ).execute()
+        snapshot_rows = [
+            {
+                "artist_id": artist.artist_id,
+                "followers": int(artist.followers or 0),
+                "snapshot_date": today,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for artist in artists
+        ]
 
-            supabase.table("artist_library").update(
-                {
-                    "followers": artist.followers,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            ).eq("artist_id", artist.artist_id).execute()
+        db.execute(
+            text(
+                """
+                INSERT INTO public.artist_follower_snapshots (artist_id, followers, snapshot_date, created_at)
+                VALUES (:artist_id, :followers, :snapshot_date, :created_at)
+                ON CONFLICT (artist_id, snapshot_date) DO UPDATE SET
+                  followers = EXCLUDED.followers,
+                  created_at = EXCLUDED.created_at
+                """
+            ),
+            snapshot_rows,
+        )
 
-            followers_7_days = calculate_7_day_followers(
-                supabase=supabase,
-                artist_id=artist.artist_id,
-                current_followers=artist.followers,
-            )
+        db.execute(
+            text(
+                """
+                UPDATE public.artist_library
+                SET followers = :followers, updated_at = :updated_at
+                WHERE artist_id = :artist_id
+                """
+            ),
+            snapshot_rows,
+        )
 
-            synced.append(
-                {
-                    "artistId": artist.artist_id,
-                    "followers": artist.followers,
-                    "followers7Days": followers_7_days,
-                }
-            )
+        artist_ids = [row["artist_id"] for row in snapshot_rows]
+        snapshot_by_artist = get_artist_snapshot_data(db, artist_ids)
+        db.commit()
 
         return {
             "success": True,
-            "snapshotDate": today,
-            "artists": synced,
+            "source": "DATABASE_URL",
+            "growthLogicVersion": GROWTH_LOGIC_VERSION,
+            "snapshotDate": today.isoformat(),
+            "artists": [
+                {
+                    "artistId": artist_id,
+                    "followers": snapshot_by_artist.get(artist_id, {}).get("followers", 0),
+                    "followers7Days": snapshot_by_artist.get(artist_id, {}).get("followers7Days", 0),
+                }
+                for artist_id in artist_ids
+            ],
         }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not sync followers: {str(error)}",
-        )
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not sync followers: {str(error)}")
 
 
 @router.post("/sync-metadata")
-def sync_metadata() -> Dict[str, Any]:
+def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
         access_token = get_spotify_access_token()
+        rows = db.execute(
+            text(
+                """
+                SELECT *
+                FROM public.artist_library
+                WHERE is_active IS TRUE
+                ORDER BY created_at ASC NULLS LAST
+                """
+            )
+        ).fetchall()
+        artists = [to_dict(row) for row in rows]
 
-        response = (
-            supabase.table("artist_library")
-            .select("*")
-            .eq("is_active", True)
-            .order("created_at", desc=False)
-            .execute()
-        )
-
-        artists = response.data or []
-        today = date.today().isoformat()
+        today = date.today()
+        now = utc_now()
         results = []
         synced_count = 0
         failed_count = 0
 
         for artist in artists:
             artist_id = artist.get("artist_id")
-
             try:
                 metadata = fetch_spotify_artist_metadata(
                     artist_id=artist_id,
                     access_token=access_token,
                 )
 
-                update_payload = {
-                    "name": metadata["name"],
-                    "spotify_url": metadata["spotify_url"],
-                    "image_url": metadata["image_url"],
-                    "genres": metadata["genres"],
-                    "followers": metadata["followers"],
-                    "popularity": metadata["popularity"],
-                    "total_releases": metadata["total_releases"],
-                    "total_tracks": metadata["total_tracks"],
-                    "latest_release": metadata["latest_release"],
-                    "recent_releases": metadata["recent_releases"],
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
+                db.execute(
+                    text(
+                        """
+                        UPDATE public.artist_library
+                        SET name = :name,
+                            spotify_url = :spotify_url,
+                            image_url = :image_url,
+                            genres = CAST(:genres AS jsonb),
+                            followers = :followers,
+                            popularity = :popularity,
+                            total_releases = :total_releases,
+                            total_tracks = :total_tracks,
+                            latest_release = CAST(:latest_release AS jsonb),
+                            recent_releases = CAST(:recent_releases AS jsonb),
+                            updated_at = :updated_at
+                        WHERE artist_id = :artist_id
+                        """
+                    ),
+                    {
+                        "artist_id": artist_id,
+                        "name": metadata["name"],
+                        "spotify_url": metadata["spotify_url"],
+                        "image_url": metadata["image_url"],
+                        "genres": json_param(metadata["genres"]),
+                        "followers": metadata["followers"],
+                        "popularity": metadata["popularity"],
+                        "total_releases": metadata["total_releases"],
+                        "total_tracks": metadata["total_tracks"],
+                        "latest_release": json_param(metadata["latest_release"]),
+                        "recent_releases": json_param(metadata["recent_releases"]),
+                        "updated_at": now,
+                    },
+                )
 
-                supabase.table("artist_library").update(update_payload).eq(
-                    "artist_id",
-                    artist_id,
-                ).execute()
-
-                snapshot_payload = {
-                    "artist_id": artist_id,
-                    "followers": metadata["followers"],
-                    "snapshot_date": today,
-                }
-
-                supabase.table("artist_follower_snapshots").upsert(
-                    snapshot_payload,
-                    on_conflict="artist_id,snapshot_date",
-                ).execute()
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO public.artist_follower_snapshots (artist_id, followers, snapshot_date, created_at)
+                        VALUES (:artist_id, :followers, :snapshot_date, :created_at)
+                        ON CONFLICT (artist_id, snapshot_date) DO UPDATE SET
+                          followers = EXCLUDED.followers,
+                          created_at = EXCLUDED.created_at
+                        """
+                    ),
+                    {
+                        "artist_id": artist_id,
+                        "followers": metadata["followers"],
+                        "snapshot_date": today,
+                        "created_at": now,
+                    },
+                )
+                db.commit()
 
                 synced_count += 1
                 results.append(
@@ -605,8 +695,8 @@ def sync_metadata() -> Dict[str, Any]:
                         "message": "Artist metadata synced",
                     }
                 )
-
             except Exception as artist_error:
+                db.rollback()
                 failed_count += 1
                 results.append(
                     {
@@ -619,18 +709,16 @@ def sync_metadata() -> Dict[str, Any]:
 
         return {
             "success": True,
+            "source": "DATABASE_URL",
+            "growthLogicVersion": GROWTH_LOGIC_VERSION,
             "total": len(artists),
             "synced": synced_count,
             "failed": failed_count,
-            "snapshotDate": today,
+            "snapshotDate": today.isoformat(),
             "results": results,
         }
-
     except HTTPException:
         raise
-
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not sync artist metadata: {str(error)}",
-        )
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not sync artist metadata: {str(error)}")
