@@ -2,16 +2,18 @@ import os
 import re
 import random
 import time
+import threading
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import Dict, List
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db, SessionLocal
+from app.core.database import get_db
 from app.models.follower_history import FollowerHistory
 from app.models.playlist import Playlist
 from app.models.ads_meta import AdsMeta
@@ -24,6 +26,15 @@ SPOTIFY_REQUEST_DELAY_SECONDS = float(os.getenv("SPOTIFY_REQUEST_DELAY_SECONDS",
 SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS = float(os.getenv("SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS", "5"))
 SPOTIFY_MAX_RETRIES = int(os.getenv("SPOTIFY_MAX_RETRIES", "4"))
 SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT = int(os.getenv("SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT", "100"))
+SYNC_ALL_COOLDOWN_SECONDS = int(os.getenv("SYNC_ALL_COOLDOWN_SECONDS", "900"))
+
+SYNC_ALL_LOCK = threading.RLock()
+SYNC_ALL_STATE = {
+    "in_progress": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_result": None,
+}
 
 
 def sleep_between_spotify_requests():
@@ -209,6 +220,61 @@ def get_history_rows(db: Session, playlist_id: int, limit: int | None = None):
         query = query.limit(limit)
 
     return query.all()
+
+
+def get_history_rows_for_playlists(
+    db: Session,
+    playlist_ids: list[int],
+    days_back: int | None = 45,
+) -> Dict[int, list[FollowerHistory]]:
+    """Load follower history for many playlists in one database query.
+
+    This avoids the old N+1 pattern where the playlist page queried
+    follower_history once per playlist. Keeping the default window at 45 days
+    gives enough data for 24h / 7D / 30D calculations and daily columns.
+    """
+    if not playlist_ids:
+        return {}
+
+    query = db.query(FollowerHistory).filter(FollowerHistory.playlist_id.in_(playlist_ids))
+
+    if days_back is not None:
+        cutoff_date = datetime.utcnow().date() - timedelta(days=days_back)
+        cutoff_datetime = datetime.combine(cutoff_date, datetime.min.time())
+
+        if hasattr(FollowerHistory, "date"):
+            query = query.filter(FollowerHistory.date >= cutoff_date)
+        else:
+            query = query.filter(FollowerHistory.created_at >= cutoff_datetime)
+
+    rows = (
+        query.order_by(FollowerHistory.playlist_id.asc(), FollowerHistory.created_at.desc())
+        .all()
+    )
+
+    grouped: Dict[int, list[FollowerHistory]] = defaultdict(list)
+    for row in rows:
+        grouped[row.playlist_id].append(row)
+
+    return dict(grouped)
+
+
+def serialize_playlist_batch(
+    playlists: list[Playlist],
+    history_by_playlist_id: Dict[int, list[FollowerHistory]] | None = None,
+    meta_by_playlist_id: Dict[int, AdsMeta] | None = None,
+):
+    history_by_playlist_id = history_by_playlist_id or {}
+    meta_by_playlist_id = meta_by_playlist_id or {}
+
+    return [
+        serialize_playlist(
+            playlist,
+            history_by_playlist_id.get(playlist.id, []),
+            meta_by_playlist_id.get(playlist.id),
+        )
+        for playlist in playlists
+    ]
 
 
 def closest_followers_at_or_before(history_rows, target: datetime):
@@ -560,6 +626,65 @@ def save_daily_growth_history(db: Session, playlist_id: int, daily_growth: int, 
     return history, True
 
 
+def get_existing_history_for_date_map(db: Session, playlist_ids: list[int], target_date):
+    """Load today's follower_history rows for many playlists with one query."""
+    if not playlist_ids:
+        return {}
+
+    query = db.query(FollowerHistory).filter(FollowerHistory.playlist_id.in_(playlist_ids))
+
+    if hasattr(FollowerHistory, "date"):
+        query = query.filter(FollowerHistory.date == target_date)
+    else:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = start + timedelta(days=1)
+        query = query.filter(
+            FollowerHistory.created_at >= start,
+            FollowerHistory.created_at < end,
+        )
+
+    rows = query.order_by(FollowerHistory.playlist_id.asc(), FollowerHistory.created_at.desc()).all()
+
+    latest_by_playlist_id = {}
+    for row in rows:
+        if row.playlist_id not in latest_by_playlist_id:
+            latest_by_playlist_id[row.playlist_id] = row
+
+    return latest_by_playlist_id
+
+
+def save_daily_growth_history_from_map(
+    db: Session,
+    playlist_id: int,
+    daily_growth: int,
+    now: datetime,
+    existing_by_playlist_id: Dict[int, FollowerHistory],
+):
+    """Insert/update daily growth using a preloaded map to avoid one query per playlist."""
+    target_date = now.date()
+    existing = existing_by_playlist_id.get(playlist_id)
+
+    if existing:
+        existing.followers = (existing.followers or 0) + (daily_growth or 0)
+        existing.created_at = now
+        if hasattr(existing, "date"):
+            existing.date = target_date
+        db.add(existing)
+        return existing, False
+
+    history = FollowerHistory(
+        playlist_id=playlist_id,
+        followers=daily_growth or 0,
+        created_at=now,
+    )
+    if hasattr(history, "date"):
+        history.date = target_date
+
+    db.add(history)
+    existing_by_playlist_id[playlist_id] = history
+    return history, True
+
+
 def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     account = get_account_or_404(db, account_id)
     spotify_items = fetch_spotify_account_playlists(db, account)
@@ -570,17 +695,28 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     history_updated = 0
     now = datetime.utcnow()
 
+    spotify_ids = [item.get("id") for item in spotify_items if item.get("id")]
+
+    existing_playlists = (
+        db.query(Playlist)
+        .filter(Playlist.account_id == account_id, Playlist.spotify_id.in_(spotify_ids))
+        .all()
+        if spotify_ids
+        else []
+    )
+    playlist_by_spotify_id = {playlist.spotify_id: playlist for playlist in existing_playlists}
+    existing_history_by_playlist_id = get_existing_history_for_date_map(
+        db,
+        [playlist.id for playlist in existing_playlists if playlist.id],
+        now.date(),
+    )
+
     for item in spotify_items:
         spotify_id = item.get("id")
         if not spotify_id:
             continue
 
-        playlist = (
-            db.query(Playlist)
-            .filter(Playlist.account_id == account_id, Playlist.spotify_id == spotify_id)
-            .first()
-        )
-
+        playlist = playlist_by_spotify_id.get(spotify_id)
         is_new_playlist = playlist is None
 
         if playlist:
@@ -611,16 +747,17 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
         db.add(playlist)
         db.flush()
 
-        try:
-            _, inserted = save_daily_growth_history(db, playlist.id, daily_growth, now)
-            if inserted:
-                history_inserted += 1
-            else:
-                history_updated += 1
-            db.flush()
-        except Exception:
-            db.rollback()
-            db.begin()
+        _, inserted = save_daily_growth_history_from_map(
+            db,
+            playlist.id,
+            daily_growth,
+            now,
+            existing_history_by_playlist_id,
+        )
+        if inserted:
+            history_inserted += 1
+        else:
+            history_updated += 1
 
     db.commit()
 
@@ -711,14 +848,8 @@ def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
     )
     meta_by_playlist_id = {meta.playlist_id: meta for meta in meta_rows}
 
-    items = [
-        serialize_playlist(
-            playlist,
-            get_history_rows(db, playlist.id),
-            meta_by_playlist_id.get(playlist.id),
-        )
-        for playlist in playlists
-    ]
+    history_by_playlist_id = get_history_rows_for_playlists(db, playlist_ids, days_back=45)
+    items = serialize_playlist_batch(playlists, history_by_playlist_id, meta_by_playlist_id)
     return {"items": items, "playlists": items}
 
 
@@ -768,14 +899,11 @@ def sync_account_playlists_api(
         "total": result["total"],
         "history_inserted": result.get("history_inserted", 0),
         "history_updated": result.get("history_updated", 0),
-        "items": [
-            serialize_playlist(
-                playlist,
-                get_history_rows(db, playlist.id),
-                meta_by_playlist_id.get(playlist.id),
-            )
-            for playlist in playlists
-        ],
+        "items": serialize_playlist_batch(
+            playlists,
+            get_history_rows_for_playlists(db, playlist_ids, days_back=45),
+            meta_by_playlist_id,
+        ),
     }
 
 @router.post("/accounts/{account_id}/playlists/sync")
@@ -1047,55 +1175,112 @@ def replace_playlist_tracks_legacy(
     return replace_playlist_tracks_logic(account_id, playlist_id, payload, db)
 
 
+def get_sync_all_status():
+    with SYNC_ALL_LOCK:
+        return {
+            "in_progress": SYNC_ALL_STATE["in_progress"],
+            "started_at": SYNC_ALL_STATE["started_at"],
+            "finished_at": SYNC_ALL_STATE["finished_at"],
+            "last_result": SYNC_ALL_STATE["last_result"],
+            "cooldown_seconds": SYNC_ALL_COOLDOWN_SECONDS,
+        }
+
+
 @router.post("/api/playlists/sync-all")
 def sync_all_playlists_api(db: Session = Depends(get_db)):
     """Run Sync All directly for dashboard/manual use.
 
-    This intentionally waits until Spotify sync finishes so the UI and logs reflect
-    whether new daily follower_history rows were created.
+    Protections added:
+    - Only one Sync All can run at a time in this backend process.
+    - A cooldown blocks accidental repeated clicks/refreshes.
+    - Database reads/writes inside account sync are batched where possible.
     """
-    account_ids = [
-        account.id
-        for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
-    ]
+    now_ts = time.time()
 
-    synced = 0
-    failed = []
-    history_inserted = 0
-    history_updated = 0
-    total_playlists = 0
+    with SYNC_ALL_LOCK:
+        if SYNC_ALL_STATE["in_progress"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Sync All is already running",
+                    "status": get_sync_all_status(),
+                },
+            )
 
-    for index, account_id in enumerate(account_ids):
-        try:
-            result = refresh_account_playlists_from_spotify(db, account_id)
-            synced += 1
-            history_inserted += result.get("history_inserted", 0)
-            history_updated += result.get("history_updated", 0)
-            total_playlists += result.get("total", 0)
-            print(f"Synced account {account_id}: {result}")
-        except Exception as exc:
-            db.rollback()
-            failed.append({"account_id": account_id, "error": str(exc)})
-            print(f"Sync failed for account {account_id}: {exc}")
+        finished_at = SYNC_ALL_STATE.get("finished_at")
+        if finished_at and SYNC_ALL_COOLDOWN_SECONDS > 0:
+            elapsed = now_ts - finished_at
+            if elapsed < SYNC_ALL_COOLDOWN_SECONDS:
+                retry_after = int(SYNC_ALL_COOLDOWN_SECONDS - elapsed)
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": f"Sync All cooldown active. Try again in {retry_after}s.",
+                        "retry_after_seconds": retry_after,
+                        "status": get_sync_all_status(),
+                    },
+                )
 
-        if index < len(account_ids) - 1 and SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS > 0:
-            time.sleep(SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS)
+        SYNC_ALL_STATE["in_progress"] = True
+        SYNC_ALL_STATE["started_at"] = datetime.utcnow().isoformat()
 
-    return {
-        "success": len(failed) == 0,
-        "message": "Sync completed",
-        "accounts": len(account_ids),
-        "synced": synced,
-        "failed": failed,
-        "history_inserted": history_inserted,
-        "history_updated": history_updated,
-        "total_playlists": total_playlists,
-    }
+    try:
+        account_ids = [
+            account.id
+            for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
+        ]
+
+        synced = 0
+        failed = []
+        history_inserted = 0
+        history_updated = 0
+        total_playlists = 0
+
+        for index, account_id in enumerate(account_ids):
+            try:
+                result = refresh_account_playlists_from_spotify(db, account_id)
+                synced += 1
+                history_inserted += result.get("history_inserted", 0)
+                history_updated += result.get("history_updated", 0)
+                total_playlists += result.get("total", 0)
+                print(f"Synced account {account_id}: {result}")
+            except Exception as exc:
+                db.rollback()
+                failed.append({"account_id": account_id, "error": str(exc)})
+                print(f"Sync failed for account {account_id}: {exc}")
+
+            if index < len(account_ids) - 1 and SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS > 0:
+                time.sleep(SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS)
+
+        result_payload = {
+            "success": len(failed) == 0,
+            "message": "Sync completed",
+            "source": "DATABASE_URL",
+            "syncProtection": "lock-and-cooldown-v1",
+            "accounts": len(account_ids),
+            "synced": synced,
+            "failed": failed,
+            "history_inserted": history_inserted,
+            "history_updated": history_updated,
+            "total_playlists": total_playlists,
+        }
+        return result_payload
+
+    finally:
+        with SYNC_ALL_LOCK:
+            SYNC_ALL_STATE["in_progress"] = False
+            SYNC_ALL_STATE["finished_at"] = time.time()
+            SYNC_ALL_STATE["last_result"] = locals().get("result_payload")
 
 
 @router.get("/api/playlists/sync-all")
-def sync_all_playlists_get_api(db: Session = Depends(get_db)):
-    return sync_all_playlists_api(db)
+def sync_all_playlists_get_api():
+    """GET returns status only. Use POST to start Sync All.
+
+    This prevents accidental browser refreshes or prefetches from starting a
+    heavy Spotify sync job.
+    """
+    return {"success": True, "message": "Use POST to start Sync All", "status": get_sync_all_status()}
 
 
 class CreatePlaylistRequest(BaseModel):
