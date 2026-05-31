@@ -1,26 +1,15 @@
-import os
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import Client, create_client
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
 
 
 router = APIRouter(prefix="/api/song-metrics", tags=["song-metrics"])
-
-
-def get_supabase() -> Client:
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not supabase_url:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL")
-
-    if not supabase_key:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_SERVICE_ROLE_KEY")
-
-    return create_client(supabase_url, supabase_key)
 
 
 class SongMetricIn(BaseModel):
@@ -70,6 +59,16 @@ def normalize_release_date(value: Optional[str]) -> Optional[str]:
         return parsed.isoformat()
     except Exception:
         return None
+
+
+def db_row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    return dict(row)
 
 
 def row_to_database(row: SongMetricIn) -> Dict[str, Any]:
@@ -131,27 +130,132 @@ def row_from_database(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+SONG_METRIC_COLUMNS = """
+    row_id,
+    track_id,
+    artist_id,
+    artist_name,
+    song_name,
+    release_date,
+    days,
+    streams,
+    listeners,
+    saves,
+    save_rate,
+    radio_rate,
+    playlists,
+    completion_rate,
+    status,
+    master_group,
+    spotify_url,
+    release_name,
+    image_url,
+    duration,
+    album_id,
+    source,
+    created_at,
+    updated_at
+"""
+
+
+UPSERT_SONG_METRIC_SQL = text(
+    """
+    INSERT INTO song_metrics (
+        row_id,
+        track_id,
+        artist_id,
+        artist_name,
+        song_name,
+        release_date,
+        days,
+        streams,
+        listeners,
+        saves,
+        save_rate,
+        radio_rate,
+        playlists,
+        completion_rate,
+        status,
+        master_group,
+        spotify_url,
+        release_name,
+        image_url,
+        duration,
+        album_id,
+        source,
+        updated_at
+    ) VALUES (
+        :row_id,
+        :track_id,
+        :artist_id,
+        :artist_name,
+        :song_name,
+        CAST(:release_date AS date),
+        :days,
+        :streams,
+        :listeners,
+        :saves,
+        :save_rate,
+        :radio_rate,
+        :playlists,
+        :completion_rate,
+        :status,
+        :master_group,
+        :spotify_url,
+        :release_name,
+        :image_url,
+        :duration,
+        :album_id,
+        :source,
+        CAST(:updated_at AS timestamp)
+    )
+    ON CONFLICT (row_id) DO UPDATE SET
+        track_id = EXCLUDED.track_id,
+        artist_id = EXCLUDED.artist_id,
+        artist_name = EXCLUDED.artist_name,
+        song_name = EXCLUDED.song_name,
+        release_date = EXCLUDED.release_date,
+        days = EXCLUDED.days,
+        streams = EXCLUDED.streams,
+        listeners = EXCLUDED.listeners,
+        saves = EXCLUDED.saves,
+        save_rate = EXCLUDED.save_rate,
+        radio_rate = EXCLUDED.radio_rate,
+        playlists = EXCLUDED.playlists,
+        completion_rate = EXCLUDED.completion_rate,
+        status = EXCLUDED.status,
+        master_group = EXCLUDED.master_group,
+        spotify_url = EXCLUDED.spotify_url,
+        release_name = EXCLUDED.release_name,
+        image_url = EXCLUDED.image_url,
+        duration = EXCLUDED.duration,
+        album_id = EXCLUDED.album_id,
+        source = EXCLUDED.source,
+        updated_at = EXCLUDED.updated_at
+    RETURNING *
+    """
+)
+
+
 @router.get("")
-def get_song_metrics() -> Dict[str, Any]:
+def get_song_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-
-        response = (
-            supabase.table("song_metrics")
-            .select("*")
-            .order("release_date", desc=True)
-            .execute()
+        result = db.execute(
+            text(
+                f"""
+                SELECT {SONG_METRIC_COLUMNS}
+                FROM song_metrics
+                ORDER BY release_date DESC NULLS LAST, created_at DESC NULLS LAST
+                """
+            )
         )
-
-        rows = response.data or []
+        rows = [db_row_to_dict(row) for row in result.fetchall()]
 
         return {
             "success": True,
+            "source": "DATABASE_URL",
             "rows": [row_from_database(row) for row in rows],
         }
-
-    except HTTPException:
-        raise
 
     except Exception as error:
         raise HTTPException(
@@ -161,33 +265,34 @@ def get_song_metrics() -> Dict[str, Any]:
 
 
 @router.post("/bulk-upsert")
-def bulk_upsert_song_metrics(payload: BulkSongMetricsRequest) -> Dict[str, Any]:
+def bulk_upsert_song_metrics(
+    payload: BulkSongMetricsRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-
         if not payload.rows:
-            return {"success": True, "saved": 0, "rows": []}
+            return {"success": True, "source": "DATABASE_URL", "saved": 0, "rows": []}
 
         rows = [row_to_database(row) for row in payload.rows]
+        saved_rows: List[Dict[str, Any]] = []
 
-        response = (
-            supabase.table("song_metrics")
-            .upsert(rows, on_conflict="row_id")
-            .execute()
-        )
+        for row in rows:
+            result = db.execute(UPSERT_SONG_METRIC_SQL, row)
+            saved_row = result.fetchone()
+            if saved_row is not None:
+                saved_rows.append(db_row_to_dict(saved_row))
 
-        saved_rows = response.data or rows
+        db.commit()
 
         return {
             "success": True,
+            "source": "DATABASE_URL",
             "saved": len(saved_rows),
             "rows": [row_from_database(row) for row in saved_rows],
         }
 
-    except HTTPException:
-        raise
-
     except Exception as error:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=f"Could not save song metrics: {str(error)}",
@@ -195,27 +300,31 @@ def bulk_upsert_song_metrics(payload: BulkSongMetricsRequest) -> Dict[str, Any]:
 
 
 @router.delete("/{row_id}")
-def delete_song_metric(row_id: str) -> Dict[str, Any]:
+def delete_song_metric(row_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     try:
-        supabase = get_supabase()
-
-        response = (
-            supabase.table("song_metrics")
-            .delete()
-            .eq("row_id", row_id)
-            .execute()
+        result = db.execute(
+            text(
+                """
+                DELETE FROM song_metrics
+                WHERE row_id = :row_id
+                RETURNING row_id
+                """
+            ),
+            {"row_id": row_id},
         )
+        deleted = [db_row_to_dict(row) for row in result.fetchall()]
+        db.commit()
 
         return {
             "success": True,
+            "source": "DATABASE_URL",
             "id": row_id,
-            "result": response.data,
+            "deleted": len(deleted),
+            "result": deleted,
         }
 
-    except HTTPException:
-        raise
-
     except Exception as error:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=f"Could not delete song metric: {str(error)}",
