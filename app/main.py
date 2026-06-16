@@ -11,7 +11,6 @@ from app.api.routes.song_metrics import router as song_metrics_router
 from app.api.routes import settings
 from app.api.routes import production_smart_segments
 
-
 from app.core.database import Base, engine
 from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
 

@@ -51,10 +51,6 @@ class ProductionSmartSegmentSheet(Base):
 
 class ProductionSmartSegmentRow(Base):
     __tablename__ = "production_smart_segment_rows"
-    __table_args__ = (
-        UniqueConstraint("table_name", "sort_order", name="uq_production_smart_segment_table_order"),
-    )
-
     id = Column(Integer, primary_key=True, index=True)
     table_name = Column(String(255), nullable=False, index=True)
     sort_order = Column(Integer, nullable=False, default=0)
@@ -298,10 +294,11 @@ def _seed_missing_tables(db: Session) -> None:
         if existing_count > 0:
             continue
 
+        next_order = _next_sort_order_for_table(db, table_name)
         for index, row in enumerate(rows):
             record = ProductionSmartSegmentRow(
                 table_name=table_name,
-                sort_order=index,
+                sort_order=next_order + index,
                 song=_normalize_text(row.get("song"), ""),
                 key_signature=_normalize_text(row.get("key_signature")),
                 chords=_normalize_text(row.get("chords")),
