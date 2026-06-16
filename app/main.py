@@ -9,6 +9,7 @@ from app.api.routes import ads_filter_options
 from app.api.routes import artist_library
 from app.api.routes.song_metrics import router as song_metrics_router
 from app.api.routes import settings
+from app.api.routes import production_smart_segments
 
 
 from app.core.database import Base, engine
@@ -51,3 +52,4 @@ app.include_router(ads_filter_options.router)
 app.include_router(artist_library.router)
 app.include_router(song_metrics_router)
 app.include_router(settings.router)
+app.include_router(production_smart_segments.router)
