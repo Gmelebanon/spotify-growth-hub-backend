@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Boolean, Column, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Column, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Session
 
 from app.core.database import Base, get_db
@@ -25,7 +26,7 @@ SEGMENT_FIELDS = [
 ]
 
 EDITABLE_TEXT_FIELDS = {"song", "key_signature", "chords", "tempo", "genre"}
-EDITABLE_FIELDS = EDITABLE_TEXT_FIELDS | set(SEGMENT_FIELDS)
+EDITABLE_FIELDS = EDITABLE_TEXT_FIELDS | set(SEGMENT_FIELDS) | {"row_color", "table_name"}
 
 TABLE_NAME_MAP = {
     "TCC - Spotify Shared - Prod Stems": "Stems",
@@ -36,7 +37,16 @@ TABLE_NAME_MAP = {
     "Production Vocals": "Vocals",
 }
 
-TABLE_ORDER = ["Stems", "Remakes", "Vocals"]
+DEFAULT_TABLE_ORDER = ["Stems", "Remakes", "Vocals"]
+ALLOWED_ROW_COLORS = {"", "green", "yellow", "blue", "purple", "pink", "orange", "red", "gray"}
+
+
+class ProductionSmartSegmentSheet(Base):
+    __tablename__ = "production_smart_segment_sheets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, unique=True, index=True)
+    sort_order = Column(Integer, nullable=False, default=0)
 
 
 class ProductionSmartSegmentRow(Base):
@@ -54,6 +64,7 @@ class ProductionSmartSegmentRow(Base):
     chords = Column(Text, nullable=False, default="-")
     tempo = Column(String(80), nullable=False, default="-")
     genre = Column(String(120), nullable=False, default="-")
+    row_color = Column(String(40), nullable=False, default="")
 
     afropop = Column(Boolean, nullable=False, default=False)
     soft_pop = Column(Boolean, nullable=False, default=False)
@@ -76,6 +87,7 @@ class SmartSegmentRowOut(BaseModel):
     chords: str
     tempo: str
     genre: str
+    row_color: str = ""
     afropop: bool
     soft_pop: bool
     hyper_pop: bool
@@ -92,11 +104,13 @@ class SmartSegmentTableOut(BaseModel):
 
 
 class SmartSegmentRowPatch(BaseModel):
+    table_name: str | None = None
     song: str | None = None
     key_signature: str | None = None
     chords: str | None = None
     tempo: str | None = None
     genre: str | None = None
+    row_color: str | None = None
     afropop: bool | None = None
     soft_pop: bool | None = None
     hyper_pop: bool | None = None
@@ -115,6 +129,20 @@ class SmartSegmentRowsDelete(BaseModel):
     row_ids: list[int]
 
 
+class SmartSegmentRowsBulkPatch(BaseModel):
+    row_ids: list[int]
+    table_name: str | None = None
+    row_color: str | None = None
+
+
+class SmartSegmentSheetCreate(BaseModel):
+    name: str
+
+
+class SmartSegmentRowsRestore(BaseModel):
+    rows: list[SmartSegmentRowPatch]
+
+
 def _seed_path() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "production_smart_segments_seed.json"
 
@@ -129,6 +157,33 @@ def _normalize_text(value: Any, fallback: str = "-") -> str:
     return cleaned or fallback
 
 
+def _normalize_color(value: Any) -> str:
+    cleaned = str(value if value is not None else "").strip().lower()
+    return cleaned if cleaned in ALLOWED_ROW_COLORS else ""
+
+
+def _ensure_schema(db: Session) -> None:
+    # Safe for PostgreSQL/Render and harmless after the first run.
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS production_smart_segment_sheets (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE production_smart_segment_rows "
+            "ADD COLUMN IF NOT EXISTS row_color VARCHAR(40) NOT NULL DEFAULT ''"
+        )
+    )
+    db.commit()
+
+
 def _load_seed_data() -> list[dict[str, Any]]:
     path = _seed_path()
     if not path.exists():
@@ -137,10 +192,46 @@ def _load_seed_data() -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
-    if not isinstance(data, list):
-        return []
+    return data if isinstance(data, list) else []
 
-    return data
+
+def _get_sheet_names(db: Session) -> list[str]:
+    sheet_rows = (
+        db.query(ProductionSmartSegmentSheet)
+        .order_by(ProductionSmartSegmentSheet.sort_order.asc(), ProductionSmartSegmentSheet.id.asc())
+        .all()
+    )
+    saved_names = [_normalize_table_name(sheet.name) for sheet in sheet_rows]
+
+    row_names = [
+        _normalize_table_name(name)
+        for (name,) in db.query(ProductionSmartSegmentRow.table_name).distinct().all()
+    ]
+
+    names: list[str] = []
+    for name in DEFAULT_TABLE_ORDER + saved_names + sorted(row_names):
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _ensure_sheet(db: Session, name: str) -> None:
+    table_name = _normalize_table_name(name)
+    if not table_name:
+        return
+
+    existing = (
+        db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.name == table_name)
+        .first()
+    )
+    if existing:
+        return
+
+    next_sort_order = (
+        db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+    )
+    db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=next_sort_order))
 
 
 def _rename_legacy_tables(db: Session) -> None:
@@ -175,7 +266,17 @@ def _rename_legacy_tables(db: Session) -> None:
 
 
 def _seed_missing_tables(db: Session) -> None:
+    _ensure_schema(db)
     _rename_legacy_tables(db)
+
+    for index, table_name in enumerate(DEFAULT_TABLE_ORDER):
+        existing = (
+            db.query(ProductionSmartSegmentSheet)
+            .filter(ProductionSmartSegmentSheet.name == table_name)
+            .first()
+        )
+        if not existing:
+            db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=index))
 
     seed_tables = _load_seed_data()
 
@@ -185,6 +286,8 @@ def _seed_missing_tables(db: Session) -> None:
 
         if not table_name or not isinstance(rows, list):
             continue
+
+        _ensure_sheet(db, table_name)
 
         existing_count = (
             db.query(ProductionSmartSegmentRow)
@@ -204,6 +307,7 @@ def _seed_missing_tables(db: Session) -> None:
                 chords=_normalize_text(row.get("chords")),
                 tempo=_normalize_text(row.get("tempo")),
                 genre=_normalize_text(row.get("genre")),
+                row_color=_normalize_color(row.get("row_color", "")),
                 afropop=bool(row.get("afropop", False)),
                 soft_pop=bool(row.get("soft_pop", False)),
                 hyper_pop=bool(row.get("hyper_pop", False)),
@@ -218,12 +322,32 @@ def _seed_missing_tables(db: Session) -> None:
     db.commit()
 
 
-def _apply_payload_to_row(row: ProductionSmartSegmentRow, payload_data: dict[str, Any]) -> None:
+def _next_sort_order(db: Session, table_name: str) -> int:
+    return (
+        db.query(func.coalesce(func.max(ProductionSmartSegmentRow.sort_order), -1))
+        .filter(ProductionSmartSegmentRow.table_name == table_name)
+        .scalar()
+        + 1
+    )
+
+
+def _apply_payload_to_row(row: ProductionSmartSegmentRow, payload_data: dict[str, Any], db: Session | None = None) -> None:
     for field, value in payload_data.items():
         if field not in EDITABLE_FIELDS:
             continue
 
-        if field in EDITABLE_TEXT_FIELDS:
+        if field == "table_name":
+            table_name = _normalize_table_name(str(value or ""))
+            if not table_name:
+                continue
+            if db is not None:
+                _ensure_sheet(db, table_name)
+                if row.table_name != table_name:
+                    row.sort_order = _next_sort_order(db, table_name)
+            row.table_name = table_name
+        elif field == "row_color":
+            row.row_color = _normalize_color(value)
+        elif field in EDITABLE_TEXT_FIELDS:
             fallback = "" if field == "song" else "-"
             setattr(row, field, _normalize_text(value, fallback))
         else:
@@ -244,33 +368,75 @@ def get_smart_segments(db: Session = Depends(get_db)):
         .all()
     )
 
-    grouped: dict[str, list[ProductionSmartSegmentRow]] = {}
+    grouped: dict[str, list[ProductionSmartSegmentRow]] = {name: [] for name in _get_sheet_names(db)}
     for row in rows:
         row.table_name = _normalize_table_name(row.table_name)
+        row.row_color = _normalize_color(getattr(row, "row_color", ""))
         grouped.setdefault(row.table_name, []).append(row)
 
-    remaining_names = sorted(name for name in grouped.keys() if name not in TABLE_ORDER)
-    ordered_names = [name for name in TABLE_ORDER if name in grouped] + remaining_names
+    return [{"name": name, "rows": grouped[name]} for name in grouped.keys()]
 
-    return [{"name": name, "rows": grouped[name]} for name in ordered_names]
+
+@router.post("/sheets", response_model=SmartSegmentTableOut)
+def create_smart_segment_sheet(payload: SmartSegmentSheetCreate, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
+    table_name = _normalize_table_name(payload.name)
+
+    if not table_name:
+        raise HTTPException(status_code=400, detail="Sheet name is required")
+
+    existing_names = set(_get_sheet_names(db))
+    if table_name in existing_names:
+        raise HTTPException(status_code=409, detail="Sheet already exists")
+
+    next_sort_order = (
+        db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+    )
+    sheet = ProductionSmartSegmentSheet(name=table_name, sort_order=next_sort_order)
+    db.add(sheet)
+    db.commit()
+
+    return {"name": table_name, "rows": []}
+
+
+@router.delete("/sheets/{sheet_name}")
+def delete_smart_segment_sheet(sheet_name: str, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
+    table_name = _normalize_table_name(unquote(sheet_name))
+
+    if table_name in DEFAULT_TABLE_ORDER:
+        raise HTTPException(status_code=400, detail="Default sheets cannot be removed")
+
+    rows_count = (
+        db.query(ProductionSmartSegmentRow)
+        .filter(ProductionSmartSegmentRow.table_name == table_name)
+        .count()
+    )
+    if rows_count > 0:
+        raise HTTPException(status_code=400, detail="Sheet is not empty")
+
+    sheet = (
+        db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.name == table_name)
+        .first()
+    )
+    if sheet:
+        db.delete(sheet)
+        db.commit()
+
+    return {"deleted": True}
 
 
 @router.post("/rows", response_model=SmartSegmentRowOut)
-def create_smart_segment_row(
-    payload: SmartSegmentRowCreate,
-    db: Session = Depends(get_db),
-):
+def create_smart_segment_row(payload: SmartSegmentRowCreate, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
     table_name = _normalize_table_name(payload.table_name)
 
-    if table_name not in TABLE_ORDER:
+    if not table_name:
         raise HTTPException(status_code=400, detail="Invalid smart segment table name")
 
-    next_sort_order = (
-        db.query(func.coalesce(func.max(ProductionSmartSegmentRow.sort_order), -1))
-        .filter(ProductionSmartSegmentRow.table_name == table_name)
-        .scalar()
-        + 1
-    )
+    _ensure_sheet(db, table_name)
+    next_sort_order = _next_sort_order(db, table_name)
 
     row = ProductionSmartSegmentRow(
         table_name=table_name,
@@ -280,6 +446,7 @@ def create_smart_segment_row(
         chords="-",
         tempo="-",
         genre="-",
+        row_color="",
         afropop=False,
         soft_pop=False,
         hyper_pop=False,
@@ -290,7 +457,7 @@ def create_smart_segment_row(
         afro_house=False,
     )
 
-    _apply_payload_to_row(row, payload.model_dump(exclude_unset=True, exclude={"table_name"}))
+    _apply_payload_to_row(row, payload.model_dump(exclude_unset=True, exclude={"table_name"}), db)
 
     db.add(row)
     db.commit()
@@ -299,17 +466,97 @@ def create_smart_segment_row(
     return row
 
 
+@router.post("/rows/restore", response_model=list[SmartSegmentRowOut])
+def restore_smart_segment_rows(payload: SmartSegmentRowsRestore, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
+    restored_rows: list[ProductionSmartSegmentRow] = []
+
+    for item in payload.rows:
+        data = item.model_dump(exclude_unset=True)
+        table_name = _normalize_table_name(str(data.get("table_name") or "Stems"))
+        _ensure_sheet(db, table_name)
+
+        row = ProductionSmartSegmentRow(
+            table_name=table_name,
+            sort_order=_next_sort_order(db, table_name),
+            song="",
+            key_signature="-",
+            chords="-",
+            tempo="-",
+            genre="-",
+            row_color="",
+            afropop=False,
+            soft_pop=False,
+            hyper_pop=False,
+            garage=False,
+            chill_house=False,
+            techno=False,
+            reggae=False,
+            afro_house=False,
+        )
+        _apply_payload_to_row(row, data, db)
+        db.add(row)
+        restored_rows.append(row)
+
+    db.commit()
+
+    for row in restored_rows:
+        db.refresh(row)
+
+    return restored_rows
+
+
+@router.patch("/rows/bulk", response_model=list[SmartSegmentRowOut])
+def bulk_update_smart_segment_rows(payload: SmartSegmentRowsBulkPatch, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
+    unique_row_ids = sorted({row_id for row_id in payload.row_ids if row_id > 0})
+
+    if not unique_row_ids:
+        return []
+
+    rows = (
+        db.query(ProductionSmartSegmentRow)
+        .filter(ProductionSmartSegmentRow.id.in_(unique_row_ids))
+        .order_by(ProductionSmartSegmentRow.sort_order.asc(), ProductionSmartSegmentRow.id.asc())
+        .all()
+    )
+
+    data = payload.model_dump(exclude_unset=True, exclude={"row_ids"})
+    target_table = data.get("table_name")
+    next_order = None
+
+    if target_table is not None:
+        target_table = _normalize_table_name(target_table)
+        if not target_table:
+            raise HTTPException(status_code=400, detail="Invalid target sheet")
+        _ensure_sheet(db, target_table)
+        next_order = _next_sort_order(db, target_table)
+
+    for row in rows:
+        if target_table is not None:
+            row.table_name = target_table
+            row.sort_order = next_order or 0
+            next_order = (next_order or 0) + 1
+        if "row_color" in data:
+            row.row_color = _normalize_color(data.get("row_color"))
+        db.add(row)
+
+    db.commit()
+
+    for row in rows:
+        db.refresh(row)
+
+    return rows
+
+
 @router.patch("/rows/{row_id}", response_model=SmartSegmentRowOut)
-def update_smart_segment_row(
-    row_id: int,
-    payload: SmartSegmentRowPatch,
-    db: Session = Depends(get_db),
-):
+def update_smart_segment_row(row_id: int, payload: SmartSegmentRowPatch, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
     row = db.get(ProductionSmartSegmentRow, row_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Smart segment row not found")
 
-    _apply_payload_to_row(row, payload.model_dump(exclude_unset=True))
+    _apply_payload_to_row(row, payload.model_dump(exclude_unset=True), db)
 
     db.add(row)
     db.commit()
@@ -319,10 +566,8 @@ def update_smart_segment_row(
 
 
 @router.delete("/rows")
-def delete_smart_segment_rows(
-    payload: SmartSegmentRowsDelete,
-    db: Session = Depends(get_db),
-):
+def delete_smart_segment_rows(payload: SmartSegmentRowsDelete, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
     unique_row_ids = sorted({row_id for row_id in payload.row_ids if row_id > 0})
 
     if not unique_row_ids:
