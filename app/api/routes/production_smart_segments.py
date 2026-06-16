@@ -47,6 +47,7 @@ class ProductionSmartSegmentSheet(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False, unique=True, index=True)
     sort_order = Column(Integer, nullable=False, default=0)
+    is_deleted = Column(Boolean, nullable=False, default=False)
 
 
 class ProductionSmartSegmentRow(Base):
@@ -135,6 +136,10 @@ class SmartSegmentSheetCreate(BaseModel):
     name: str
 
 
+class SmartSegmentSheetRename(BaseModel):
+    name: str
+
+
 class SmartSegmentRowsRestore(BaseModel):
     rows: list[SmartSegmentRowPatch]
 
@@ -166,7 +171,8 @@ def _ensure_schema(db: Session) -> None:
             CREATE TABLE IF NOT EXISTS production_smart_segment_sheets (
                 id SERIAL PRIMARY KEY,
                 name VARCHAR(255) NOT NULL UNIQUE,
-                sort_order INTEGER NOT NULL DEFAULT 0
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                is_deleted BOOLEAN NOT NULL DEFAULT FALSE
             )
             """
         )
@@ -175,6 +181,12 @@ def _ensure_schema(db: Session) -> None:
         text(
             "ALTER TABLE production_smart_segment_rows "
             "ADD COLUMN IF NOT EXISTS row_color VARCHAR(40) NOT NULL DEFAULT ''"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE production_smart_segment_sheets "
+            "ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE"
         )
     )
     db.commit()
@@ -194,6 +206,7 @@ def _load_seed_data() -> list[dict[str, Any]]:
 def _get_sheet_names(db: Session) -> list[str]:
     sheet_rows = (
         db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.is_deleted.is_(False))
         .order_by(ProductionSmartSegmentSheet.sort_order.asc(), ProductionSmartSegmentSheet.id.asc())
         .all()
     )
@@ -205,7 +218,7 @@ def _get_sheet_names(db: Session) -> list[str]:
     ]
 
     names: list[str] = []
-    for name in DEFAULT_TABLE_ORDER + saved_names + sorted(row_names):
+    for name in saved_names + sorted(row_names):
         if name and name not in names:
             names.append(name)
     return names
@@ -222,6 +235,9 @@ def _ensure_sheet(db: Session, name: str) -> None:
         .first()
     )
     if existing:
+        if getattr(existing, "is_deleted", False):
+            existing.is_deleted = False
+            db.add(existing)
         return
 
     next_sort_order = (
@@ -406,18 +422,96 @@ def create_smart_segment_sheet(payload: SmartSegmentSheetCreate, db: Session = D
     if not table_name:
         raise HTTPException(status_code=400, detail="Sheet name is required")
 
-    existing_names = set(_get_sheet_names(db))
-    if table_name in existing_names:
+    existing_active_names = set(_get_sheet_names(db))
+    if table_name in existing_active_names:
         raise HTTPException(status_code=409, detail="Sheet already exists")
 
-    next_sort_order = (
-        db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+    existing_sheet = (
+        db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.name == table_name)
+        .first()
     )
-    sheet = ProductionSmartSegmentSheet(name=table_name, sort_order=next_sort_order)
-    db.add(sheet)
+
+    if existing_sheet:
+        existing_sheet.is_deleted = False
+        db.add(existing_sheet)
+    else:
+        next_sort_order = (
+            db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+        )
+        db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=next_sort_order, is_deleted=False))
+
     db.commit()
 
     return {"name": table_name, "rows": []}
+
+
+@router.patch("/sheets/{sheet_name}", response_model=SmartSegmentTableOut)
+@router.put("/sheets/{sheet_name}", response_model=SmartSegmentTableOut)
+@router.post("/sheets/{sheet_name}/rename", response_model=SmartSegmentTableOut)
+def rename_smart_segment_sheet(sheet_name: str, payload: SmartSegmentSheetRename, db: Session = Depends(get_db)):
+    _seed_missing_tables(db)
+    current_name = _normalize_table_name(unquote(sheet_name))
+    next_name = _normalize_table_name(payload.name)
+
+    if not current_name or not next_name:
+        raise HTTPException(status_code=400, detail="Sheet name is required")
+
+    if current_name == next_name:
+        rows = (
+            db.query(ProductionSmartSegmentRow)
+            .filter(ProductionSmartSegmentRow.table_name == current_name)
+            .order_by(ProductionSmartSegmentRow.sort_order.asc(), ProductionSmartSegmentRow.id.asc())
+            .all()
+        )
+        return {"name": current_name, "rows": rows}
+
+    active_names = set(_get_sheet_names(db))
+    if next_name in active_names:
+        raise HTTPException(status_code=409, detail="Sheet already exists")
+
+    sheet = (
+        db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.name == current_name)
+        .first()
+    )
+    if sheet is None:
+        next_sort_order = (
+            db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+        )
+        sheet = ProductionSmartSegmentSheet(name=current_name, sort_order=next_sort_order, is_deleted=False)
+        db.add(sheet)
+        db.flush()
+
+    existing_deleted_sheet = (
+        db.query(ProductionSmartSegmentSheet)
+        .filter(ProductionSmartSegmentSheet.name == next_name)
+        .first()
+    )
+    if existing_deleted_sheet and existing_deleted_sheet.id != sheet.id:
+        db.delete(existing_deleted_sheet)
+        db.flush()
+
+    sheet.name = next_name
+    sheet.is_deleted = False
+
+    rows = (
+        db.query(ProductionSmartSegmentRow)
+        .filter(ProductionSmartSegmentRow.table_name == current_name)
+        .order_by(ProductionSmartSegmentRow.sort_order.asc(), ProductionSmartSegmentRow.id.asc())
+        .all()
+    )
+    for row in rows:
+        row.table_name = next_name
+        db.add(row)
+
+    db.add(sheet)
+    db.commit()
+
+    for row in rows:
+        db.refresh(row)
+
+    return {"name": next_name, "rows": rows}
 
 
 @router.delete("/sheets/{sheet_name}")
@@ -425,16 +519,21 @@ def delete_smart_segment_sheet(sheet_name: str, db: Session = Depends(get_db)):
     _seed_missing_tables(db)
     table_name = _normalize_table_name(unquote(sheet_name))
 
-    if table_name in DEFAULT_TABLE_ORDER:
-        raise HTTPException(status_code=400, detail="Default sheets cannot be removed")
+    if not table_name:
+        raise HTTPException(status_code=400, detail="Sheet name is required")
 
-    rows_count = (
+    active_names = [name for name in _get_sheet_names(db) if name != table_name]
+    if not active_names:
+        raise HTTPException(status_code=400, detail="At least one sheet must remain")
+
+    rows = (
         db.query(ProductionSmartSegmentRow)
         .filter(ProductionSmartSegmentRow.table_name == table_name)
-        .count()
+        .all()
     )
-    if rows_count > 0:
-        raise HTTPException(status_code=400, detail="Sheet is not empty")
+    deleted_count = len(rows)
+    for row in rows:
+        db.delete(row)
 
     sheet = (
         db.query(ProductionSmartSegmentSheet)
@@ -442,10 +541,17 @@ def delete_smart_segment_sheet(sheet_name: str, db: Session = Depends(get_db)):
         .first()
     )
     if sheet:
-        db.delete(sheet)
-        db.commit()
+        sheet.is_deleted = True
+        db.add(sheet)
+    else:
+        next_sort_order = (
+            db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+        )
+        db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=next_sort_order, is_deleted=True))
 
-    return {"deleted": True}
+    db.commit()
+
+    return {"deleted": True, "deleted_count": deleted_count}
 
 
 @router.post("/rows", response_model=SmartSegmentRowOut)
