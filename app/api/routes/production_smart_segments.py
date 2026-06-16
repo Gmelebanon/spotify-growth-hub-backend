@@ -265,16 +265,43 @@ def _seed_missing_tables(db: Session) -> None:
     _ensure_schema(db)
     _rename_legacy_tables(db)
 
-    for index, table_name in enumerate(DEFAULT_TABLE_ORDER):
-        existing = (
-            db.query(ProductionSmartSegmentSheet)
-            .filter(ProductionSmartSegmentSheet.name == table_name)
-            .first()
-        )
-        if not existing:
-            db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=index))
-
+    # Build one de-duplicated sheet list before inserting.
+    # This prevents PostgreSQL unique-name errors when old seed names
+    # and new short names both normalize to Stems / Remakes / Vocals.
     seed_tables = _load_seed_data()
+    desired_sheets: list[str] = []
+
+    for name in DEFAULT_TABLE_ORDER:
+        normalized = _normalize_table_name(name)
+        if normalized and normalized not in desired_sheets:
+            desired_sheets.append(normalized)
+
+    for table in seed_tables:
+        normalized = _normalize_table_name(str(table.get("name", "")).strip())
+        if normalized and normalized not in desired_sheets:
+            desired_sheets.append(normalized)
+
+    existing_sheet_names = {
+        _normalize_table_name(name)
+        for (name,) in db.query(ProductionSmartSegmentSheet.name).all()
+    }
+
+    next_sheet_order = (
+        db.query(func.coalesce(func.max(ProductionSmartSegmentSheet.sort_order), -1)).scalar() + 1
+    )
+
+    for index, table_name in enumerate(desired_sheets):
+        if table_name in existing_sheet_names:
+            continue
+
+        sort_order = DEFAULT_TABLE_ORDER.index(table_name) if table_name in DEFAULT_TABLE_ORDER else next_sheet_order
+        if table_name not in DEFAULT_TABLE_ORDER:
+            next_sheet_order += 1
+
+        db.add(ProductionSmartSegmentSheet(name=table_name, sort_order=sort_order))
+        existing_sheet_names.add(table_name)
+
+    db.flush()
 
     for table in seed_tables:
         table_name = _normalize_table_name(str(table.get("name", "")).strip())
@@ -282,8 +309,6 @@ def _seed_missing_tables(db: Session) -> None:
 
         if not table_name or not isinstance(rows, list):
             continue
-
-        _ensure_sheet(db, table_name)
 
         existing_count = (
             db.query(ProductionSmartSegmentRow)
@@ -294,7 +319,7 @@ def _seed_missing_tables(db: Session) -> None:
         if existing_count > 0:
             continue
 
-        next_order = _next_sort_order_for_table(db, table_name)
+        next_order = _next_sort_order(db, table_name)
         for index, row in enumerate(rows):
             record = ProductionSmartSegmentRow(
                 table_name=table_name,
@@ -317,7 +342,6 @@ def _seed_missing_tables(db: Session) -> None:
             db.add(record)
 
     db.commit()
-
 
 def _next_sort_order(db: Session, table_name: str) -> int:
     return (
