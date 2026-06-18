@@ -243,6 +243,8 @@ def create_sheet(payload: SchedulingSheetCreate, db: Session = Depends(get_db)):
 
 
 @router.patch("/sheets/{sheet_id}", response_model=SchedulingSheetOut)
+@router.put("/sheets/{sheet_id}", response_model=SchedulingSheetOut)
+@router.post("/sheets/{sheet_id}/rename", response_model=SchedulingSheetOut)
 def rename_sheet(sheet_id: int, payload: SchedulingSheetRename, db: Session = Depends(get_db)):
     ensure_scheduling_seeded(db)
 
