@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -205,9 +205,26 @@ def get_or_create_default_sheet(db: Session) -> SchedulingSheet:
     return sheet
 
 
+def get_first_sheet(db: Session) -> Optional[SchedulingSheet]:
+    return (
+        db.query(SchedulingSheet)
+        .order_by(SchedulingSheet.sort_order.asc(), SchedulingSheet.id.asc())
+        .first()
+    )
+
+
 def ensure_scheduling_seeded(db: Session) -> None:
     ensure_scheduling_schema(db)
-    default_sheet = get_or_create_default_sheet(db)
+
+    existing_sheet = get_first_sheet(db)
+    existing_count = db.query(func.count(SchedulingRow.id)).scalar() or 0
+
+    # Only create the original Schedule sheet when the database is completely empty.
+    # This lets users delete the Schedule sheet after creating their own sheets.
+    if existing_sheet is None:
+        default_sheet = get_or_create_default_sheet(db)
+    else:
+        default_sheet = existing_sheet
 
     # Migrate old rows that existed before sheets were added.
     db.query(SchedulingRow).filter(SchedulingRow.sheet_id.is_(None)).update(
@@ -216,10 +233,10 @@ def ensure_scheduling_seeded(db: Session) -> None:
     )
     db.commit()
 
-    existing_count = db.query(func.count(SchedulingRow.id)).scalar() or 0
     if existing_count > 0:
         return
 
+    # Seed the table only for a fresh database with no rows.
     rows = []
     for index, item in enumerate(load_seed_rows()):
         rows.append(
