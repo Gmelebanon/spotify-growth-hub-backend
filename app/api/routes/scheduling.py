@@ -308,6 +308,22 @@ def rename_sheet(sheet_id: int, payload: SchedulingSheetRename, db: Session = De
     return SchedulingSheetOut.model_validate(sheet)
 
 
+
+@router.delete("/sheets/{sheet_id}")
+def delete_sheet(sheet_id: int, db: Session = Depends(get_db)):
+    ensure_scheduling_seeded(db)
+
+    sheet = get_sheet_or_404(sheet_id, db)
+
+    rows = db.query(SchedulingRow).filter(SchedulingRow.sheet_id == sheet_id).all()
+    for row in rows:
+        db.delete(row)
+
+    db.delete(sheet)
+    db.commit()
+    return {"ok": True, "deleted_sheet_id": sheet_id, "deleted_rows": len(rows)}
+
+
 @router.post("/rows", response_model=SchedulingRowOut)
 @router.post("", response_model=SchedulingRowOut)
 @router.post("/", response_model=SchedulingRowOut)
