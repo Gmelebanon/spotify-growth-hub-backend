@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Boolean, Column, Integer, String, Text, func
+from sqlalchemy import Boolean, Column, Integer, String, Text, func, text
 from sqlalchemy.orm import Session
 
 from app.core.database import Base, get_db
@@ -145,6 +145,46 @@ def load_seed_rows() -> list[dict[str, Any]]:
         return []
 
 
+
+def ensure_scheduling_schema(db: Session) -> None:
+    """Create missing columns for older databases.
+
+    SQLAlchemy create_all creates new tables but does not alter existing tables.
+    This keeps existing Supabase data while adding sheet support.
+    """
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS scheduling_sheets (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+    )
+
+    db.execute(
+        text(
+            """
+            ALTER TABLE IF EXISTS scheduling_rows
+            ADD COLUMN IF NOT EXISTS sheet_id INTEGER
+            """
+        )
+    )
+
+    db.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_scheduling_rows_sheet_id
+            ON scheduling_rows (sheet_id)
+            """
+        )
+    )
+
+    db.commit()
+
+
 def get_or_create_default_sheet(db: Session) -> SchedulingSheet:
     sheet = (
         db.query(SchedulingSheet)
@@ -166,6 +206,7 @@ def get_or_create_default_sheet(db: Session) -> SchedulingSheet:
 
 
 def ensure_scheduling_seeded(db: Session) -> None:
+    ensure_scheduling_schema(db)
     default_sheet = get_or_create_default_sheet(db)
 
     # Migrate old rows that existed before sheets were added.
