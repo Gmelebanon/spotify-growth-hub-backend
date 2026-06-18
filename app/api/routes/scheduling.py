@@ -26,6 +26,8 @@ EDITABLE_TEXT_FIELDS = {
 }
 EDITABLE_FIELDS = EDITABLE_TEXT_FIELDS | {"is_selected"}
 
+DEFAULT_SHEET_NAME = "Schedule"
+
 STATUS_OPTIONS = [
     "In Progress",
     "Online",
@@ -38,10 +40,19 @@ STATUS_OPTIONS = [
 ]
 
 
+class SchedulingSheet(Base):
+    __tablename__ = "scheduling_sheets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, unique=True, index=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+
 class SchedulingRow(Base):
     __tablename__ = "scheduling_rows"
 
     id = Column(Integer, primary_key=True, index=True)
+    sheet_id = Column(Integer, nullable=True, index=True)
     sort_order = Column(Integer, nullable=False, default=0)
     is_selected = Column(Boolean, nullable=False, default=False)
 
@@ -56,10 +67,19 @@ class SchedulingRow(Base):
     remarks = Column(Text, nullable=False, default="")
 
 
+class SchedulingSheetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    sort_order: int
+
+
 class SchedulingRowOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    sheet_id: int | None = None
     sort_order: int
     is_selected: bool = False
     genre: str = ""
@@ -73,7 +93,21 @@ class SchedulingRowOut(BaseModel):
     remarks: str = ""
 
 
+class SchedulingPayload(BaseModel):
+    sheets: list[SchedulingSheetOut]
+    rows: list[SchedulingRowOut]
+
+
+class SchedulingSheetCreate(BaseModel):
+    name: str
+
+
+class SchedulingSheetRename(BaseModel):
+    name: str
+
+
 class SchedulingRowCreate(BaseModel):
+    sheet_id: int | None = None
     is_selected: bool = False
     genre: str = ""
     status: str = ""
@@ -111,7 +145,36 @@ def load_seed_rows() -> list[dict[str, Any]]:
         return []
 
 
+def get_or_create_default_sheet(db: Session) -> SchedulingSheet:
+    sheet = (
+        db.query(SchedulingSheet)
+        .filter(SchedulingSheet.name == DEFAULT_SHEET_NAME)
+        .first()
+    )
+    if sheet is not None:
+        return sheet
+
+    max_sort = db.query(func.max(SchedulingSheet.sort_order)).scalar()
+    sheet = SchedulingSheet(
+        name=DEFAULT_SHEET_NAME,
+        sort_order=int(max_sort or 0),
+    )
+    db.add(sheet)
+    db.commit()
+    db.refresh(sheet)
+    return sheet
+
+
 def ensure_scheduling_seeded(db: Session) -> None:
+    default_sheet = get_or_create_default_sheet(db)
+
+    # Migrate old rows that existed before sheets were added.
+    db.query(SchedulingRow).filter(SchedulingRow.sheet_id.is_(None)).update(
+        {SchedulingRow.sheet_id: default_sheet.id},
+        synchronize_session=False,
+    )
+    db.commit()
+
     existing_count = db.query(func.count(SchedulingRow.id)).scalar() or 0
     if existing_count > 0:
         return
@@ -120,6 +183,7 @@ def ensure_scheduling_seeded(db: Session) -> None:
     for index, item in enumerate(load_seed_rows()):
         rows.append(
             SchedulingRow(
+                sheet_id=default_sheet.id,
                 sort_order=int(item.get("sort_order", index)),
                 is_selected=bool(item.get("is_selected", False)),
                 genre=normalize_text(item.get("genre", "")),
@@ -139,23 +203,82 @@ def ensure_scheduling_seeded(db: Session) -> None:
         db.commit()
 
 
-@router.get("", response_model=list[SchedulingRowOut])
-@router.get("/", response_model=list[SchedulingRowOut])
-def list_scheduling_rows(db: Session = Depends(get_db)):
+def get_sheet_or_404(sheet_id: int, db: Session) -> SchedulingSheet:
+    sheet = db.query(SchedulingSheet).filter(SchedulingSheet.id == sheet_id).first()
+    if sheet is None:
+        raise HTTPException(status_code=404, detail="Scheduling sheet not found.")
+    return sheet
+
+
+@router.get("", response_model=SchedulingPayload)
+@router.get("/", response_model=SchedulingPayload)
+def list_scheduling(db: Session = Depends(get_db)):
     ensure_scheduling_seeded(db)
+    sheets = db.query(SchedulingSheet).order_by(SchedulingSheet.sort_order.asc(), SchedulingSheet.id.asc()).all()
     rows = db.query(SchedulingRow).order_by(SchedulingRow.sort_order.asc(), SchedulingRow.id.asc()).all()
-    return [SchedulingRowOut.model_validate(row) for row in rows]
+    return SchedulingPayload(
+        sheets=[SchedulingSheetOut.model_validate(sheet) for sheet in sheets],
+        rows=[SchedulingRowOut.model_validate(row) for row in rows],
+    )
 
 
+@router.post("/sheets", response_model=SchedulingSheetOut)
+def create_sheet(payload: SchedulingSheetCreate, db: Session = Depends(get_db)):
+    ensure_scheduling_seeded(db)
+
+    name = normalize_text(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Sheet name is required.")
+
+    existing = db.query(SchedulingSheet).filter(func.lower(SchedulingSheet.name) == name.lower()).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Sheet name already exists.")
+
+    max_sort = db.query(func.max(SchedulingSheet.sort_order)).scalar()
+    sheet = SchedulingSheet(name=name, sort_order=int(max_sort or 0) + 1)
+    db.add(sheet)
+    db.commit()
+    db.refresh(sheet)
+    return SchedulingSheetOut.model_validate(sheet)
+
+
+@router.patch("/sheets/{sheet_id}", response_model=SchedulingSheetOut)
+def rename_sheet(sheet_id: int, payload: SchedulingSheetRename, db: Session = Depends(get_db)):
+    ensure_scheduling_seeded(db)
+
+    sheet = get_sheet_or_404(sheet_id, db)
+    name = normalize_text(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Sheet name is required.")
+
+    duplicate = (
+        db.query(SchedulingSheet)
+        .filter(func.lower(SchedulingSheet.name) == name.lower(), SchedulingSheet.id != sheet_id)
+        .first()
+    )
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="Sheet name already exists.")
+
+    sheet.name = name
+    db.commit()
+    db.refresh(sheet)
+    return SchedulingSheetOut.model_validate(sheet)
+
+
+@router.post("/rows", response_model=SchedulingRowOut)
 @router.post("", response_model=SchedulingRowOut)
 @router.post("/", response_model=SchedulingRowOut)
 def create_scheduling_row(payload: SchedulingRowCreate, db: Session = Depends(get_db)):
     ensure_scheduling_seeded(db)
 
-    max_sort = db.query(func.max(SchedulingRow.sort_order)).scalar()
+    sheet_id = payload.sheet_id or get_or_create_default_sheet(db).id
+    get_sheet_or_404(sheet_id, db)
+
+    max_sort = db.query(func.max(SchedulingRow.sort_order)).filter(SchedulingRow.sheet_id == sheet_id).scalar()
     next_sort = int(max_sort or 0) + 1
 
     row = SchedulingRow(
+        sheet_id=sheet_id,
         sort_order=next_sort,
         is_selected=payload.is_selected,
         genre=normalize_text(payload.genre),
@@ -174,6 +297,7 @@ def create_scheduling_row(payload: SchedulingRowCreate, db: Session = Depends(ge
     return SchedulingRowOut.model_validate(row)
 
 
+@router.patch("/rows/{row_id}", response_model=SchedulingRowOut)
 @router.patch("/{row_id}", response_model=SchedulingRowOut)
 def update_scheduling_row(row_id: int, payload: SchedulingRowPatch, db: Session = Depends(get_db)):
     ensure_scheduling_seeded(db)
@@ -195,6 +319,7 @@ def update_scheduling_row(row_id: int, payload: SchedulingRowPatch, db: Session 
     return SchedulingRowOut.model_validate(row)
 
 
+@router.delete("/rows/{row_id}")
 @router.delete("/{row_id}")
 def delete_scheduling_row(row_id: int, db: Session = Depends(get_db)):
     ensure_scheduling_seeded(db)
