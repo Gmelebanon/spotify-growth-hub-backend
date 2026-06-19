@@ -361,41 +361,37 @@ def youtube_record(cells: list[str]) -> dict[str, Any] | None:
     }
 
 
-def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
-    # Kworb /charts/ rows:
-    # Country / iTunes / Spotify / Apple Music / YouTube / Shazam / Deezer
+
+def aggregate_country_alias(value: str) -> str | None:
+    cleaned = clean_text(value)
+
+    aliases = {
+        "United States": "US",
+        "US": "US",
+        "USA": "US",
+        "United Kingdom": "UK",
+        "UK": "UK",
+        "Australia": "Australia",
+        "Germany": "Germany",
+        "France": "France",
+        "Brazil": "Brazil",
+        "Spain": "Spain",
+        "Italy": "Italy",
+    }
+
+    return aliases.get(cleaned)
+
+
+def make_aggregate_row(cells: list[str]) -> dict[str, Any] | None:
     if len(cells) < 7:
         return None
 
-    country = clean_text(cells[0])
-    if not country:
+    display_country = aggregate_country_alias(cells[0])
+    if not display_country:
         return None
-
-    ignored = {
-        "country",
-        "main countries:",
-        "other countries:",
-        "itunes",
-        "spotify",
-        "apple music",
-        "youtube",
-        "shazam",
-        "deezer",
-    }
-
-    if country.lower() in ignored:
-        return None
-
-    if country.lower().startswith("current charts"):
-        return None
-
-    if country not in AGGREGATE_ALLOWED_COUNTRIES:
-        return None
-
-    display_country = AGGREGATE_ALLOWED_COUNTRIES[country]
 
     return {
-        "position": 0,
+        "position": AGGREGATE_COUNTRY_ORDER.get(display_country, 999),
         "position_change": "",
         "artist": "",
         "title": display_country,
@@ -417,6 +413,91 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
         "deezer": clean_text(cells[6]) if len(cells) > 6 else "",
         "raw": cells,
     }
+
+
+def parse_aggregate_html(html: str, limit: int) -> list[dict[str, Any]]:
+    parser = KworbTableParser()
+    parser.feed(html)
+
+    rows: list[dict[str, Any]] = []
+
+    for cells in parser.rows:
+        record = make_aggregate_row(cells)
+        if record:
+            rows.append(record)
+
+    # Fallback for pages where rows are exposed in rendered text but not captured
+    # by the simple table parser.
+    if not rows:
+        # Remove scripts/styles and convert tags to line breaks so country rows
+        # and song cells remain parseable.
+        cleaned_html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_html = re.sub(r"<style.*?</style>", " ", cleaned_html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "\n", cleaned_html)
+        lines = [clean_text(line) for line in text.splitlines()]
+        lines = [line for line in lines if line]
+
+        allowed_full_names = [
+            "United States",
+            "United Kingdom",
+            "Australia",
+            "Germany",
+            "France",
+            "Brazil",
+            "Spain",
+            "Italy",
+        ]
+
+        for index, line in enumerate(lines):
+            display_country = aggregate_country_alias(line)
+            if not display_country or line not in allowed_full_names:
+                continue
+
+            values: list[str] = []
+            pointer = index + 1
+            while pointer < len(lines) and len(values) < 6:
+                candidate = lines[pointer]
+                pointer += 1
+
+                if aggregate_country_alias(candidate):
+                    break
+
+                if candidate.lower() in {
+                    "country",
+                    "itunes",
+                    "spotify",
+                    "apple music",
+                    "youtube",
+                    "shazam",
+                    "deezer",
+                    "main countries:",
+                    "other countries:",
+                }:
+                    continue
+
+                values.append(candidate)
+
+            if len(values) >= 6:
+                record = make_aggregate_row([line, *values[:6]])
+                if record:
+                    rows.append(record)
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        country = str(row.get("country", ""))
+        if country:
+            deduped[country] = row
+
+    ordered = sorted(
+        deduped.values(),
+        key=lambda row: AGGREGATE_COUNTRY_ORDER.get(str(row.get("country", "")), 999),
+    )
+
+    return ordered[:limit]
+
+
+def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
+    return make_aggregate_row(cells)
 
 
 TIKTOK_NAV_TITLES = {
@@ -617,6 +698,9 @@ def parse_tiktok_html(html: str, limit: int) -> list[dict[str, Any]]:
 
 
 def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
+    if platform == "aggregate":
+        return parse_aggregate_html(html, limit)
+
     if platform == "tiktok":
         return parse_tiktok_html(html, limit)
 
