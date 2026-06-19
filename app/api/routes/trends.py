@@ -21,7 +21,7 @@ CHARTEX_API_BASE_URL = os.getenv("CHARTEX_API_BASE_URL", "https://api.chartex.co
 CHARTEX_API_KEY = os.getenv("CHARTEX_API_KEY", "")
 CHARTEX_APP_ID = os.getenv("CHARTEX_APP_ID", "")
 CHARTEX_APP_TOKEN = os.getenv("CHARTEX_APP_TOKEN", "")
-CHARTEX_MIN_VALUE = int(os.getenv("CHARTEX_MIN_VALUE", "10000"))
+CHARTEX_MIN_VALUE = int(os.getenv("CHARTEX_MIN_VALUE", "0"))
 
 
 class TikTokTrendRow(Base):
@@ -712,6 +712,10 @@ def normalize_tiktok_view(view: str) -> str:
     return view
 
 
+def chartex_songs_url() -> str:
+    return f"{CHARTEX_API_BASE_URL.rstrip('/')}/external/v1/songs/"
+
+
 def chartex_sounds_url() -> str:
     return f"{CHARTEX_API_BASE_URL.rstrip('/')}/external/v1/tiktok-sounds/"
 
@@ -723,18 +727,38 @@ def chartex_sort_by_for_view(view: str) -> str:
     return "tiktok_last_7_days_video_count"
 
 
-def chartex_params(view: str, country_code: str) -> dict[str, Any]:
+def chartex_song_params(country_code: str) -> dict[str, Any]:
+    # Songs Chart is the best match for "TikTok creations" because the docs say
+    # total_sound_count is available for TikTok songs and country_codes can filter.
+    params: dict[str, Any] = {
+        "sort_platform": "tiktok",
+        "sort_column": "total_sound_count",
+        "page": 1,
+        "limit": 100,
+    }
+
+    if country_code:
+        params["country_codes"] = country_code
+
+    if CHARTEX_MIN_VALUE > 0:
+        params["min_tiktok_sounds_count"] = CHARTEX_MIN_VALUE
+
+    return params
+
+
+def chartex_sound_params(view: str, country_code: str) -> dict[str, Any]:
+    # Fallback if the Songs endpoint returns no rows.
     params: dict[str, Any] = {
         "sort_by": chartex_sort_by_for_view(view),
         "page": 1,
         "limit": 100,
-        "min_value": CHARTEX_MIN_VALUE,
-        "only_music": "true",
     }
 
-    # Chartex docs say leaving country_codes empty returns worldwide.
     if country_code:
         params["country_codes"] = country_code
+
+    if CHARTEX_MIN_VALUE > 0:
+        params["min_value"] = CHARTEX_MIN_VALUE
 
     return params
 
@@ -832,6 +856,8 @@ def collect_candidate_lists(value: Any, lists: list[list[dict[str, Any]]]) -> No
 
 
 def tiktok_item_to_row(item: dict[str, Any], fallback_position: int) -> dict[str, Any] | None:
+    # Chartex Songs endpoint can return nested song/artist/platform objects.
+    # Chartex TikTok Sounds endpoint can return nested sound/song/creator objects.
     title = first_nested_string(
         item,
         [
@@ -840,9 +866,15 @@ def tiktok_item_to_row(item: dict[str, Any], fallback_position: int) -> dict[str
             "songTitle",
             "track_title",
             "trackTitle",
-            "name",
+            "song_name",
+            "songName",
             "sound_title",
             "soundTitle",
+            "sound_name",
+            "soundName",
+            "music_title",
+            "musicTitle",
+            "name",
         ],
     )
 
@@ -852,29 +884,39 @@ def tiktok_item_to_row(item: dict[str, Any], fallback_position: int) -> dict[str
             "artist",
             "artist_name",
             "artistName",
+            "artists",
             "author",
             "author_name",
             "authorName",
             "creator",
             "creator_name",
             "performer",
+            "owner",
         ],
     )
 
     if not title:
         return None
 
-    position = first_nested_int(item, ["rank", "position", "chart_position", "chartPosition"])
+    # Avoid rows where the API object name is a wrapper/list label.
+    if title.lower() in {"results", "data", "song", "sound", "artist"}:
+        return None
+
+    position = first_nested_int(
+        item,
+        ["rank", "position", "chart_position", "chartPosition", "current_rank", "currentRank"],
+    )
     if position is None:
         position = fallback_position
 
     creates = first_nested_int(
         item,
         [
-            "tiktok_last_24_hours_video_count",
-            "tiktok_last_7_days_video_count",
-            "tiktok_total_video_count",
             "total_sound_count",
+            "tiktok_total_video_count",
+            "tiktok_last_7_days_video_count",
+            "tiktok_last_24_hours_video_count",
+            "tiktok_video_count",
             "sound_count",
             "sounds_count",
             "video_count",
@@ -920,6 +962,29 @@ def extract_chartex_rows(payload: Any) -> list[dict[str, Any]]:
             deduped[key] = row
 
     return sorted(deduped.values(), key=lambda item: int(item.get("position") or 999999))
+
+
+def payload_debug_summary(payload: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "payload_type": type(payload).__name__,
+    }
+
+    if isinstance(payload, dict):
+        summary["top_level_keys"] = list(payload.keys())[:30]
+        for key in ["results", "data", "items", "songs", "sounds"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                summary[f"{key}_length"] = len(value)
+                if value and isinstance(value[0], dict):
+                    summary[f"{key}_first_keys"] = list(value[0].keys())[:40]
+                break
+
+    if isinstance(payload, list):
+        summary["list_length"] = len(payload)
+        if payload and isinstance(payload[0], dict):
+            summary["first_item_keys"] = list(payload[0].keys())[:40]
+
+    return summary
 
 
 def serialize_tiktok_row(row: TikTokTrendRow) -> dict[str, Any]:
@@ -999,18 +1064,54 @@ def sync_tiktok_chart(
 
     country_info = TIKTOK_COUNTRIES[normalized_country]
     period = tiktok_period_for_view(normalized_view)
-    url = chartex_sounds_url()
-    params = chartex_params(normalized_view, country_info.get("code", ""))
+    country_code = country_info.get("code", "")
 
-    response = requests.get(url, headers=chartex_headers(), params=params, timeout=30)
-    response.raise_for_status()
+    attempts: list[dict[str, Any]] = []
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Chartex API did not return JSON.") from exc
+    # Try the Songs Chart first because it is the chart-level endpoint for songs.
+    request_plan = [
+        ("songs", chartex_songs_url(), chartex_song_params(country_code)),
+        ("sounds", chartex_sounds_url(), chartex_sound_params(normalized_view, country_code)),
+    ]
 
-    rows = extract_chartex_rows(payload)
+    rows: list[dict[str, Any]] = []
+    selected_payload: Any = None
+    selected_source = ""
+    selected_url = ""
+    selected_params: dict[str, Any] = {}
+
+    for source_name, url, params in request_plan:
+        response = requests.get(url, headers=chartex_headers(), params=params, timeout=30)
+        response.raise_for_status()
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Chartex API did not return JSON.") from exc
+
+        extracted_rows = extract_chartex_rows(payload)
+        attempts.append({
+            "source": source_name,
+            "url": url,
+            "params": params,
+            "rows_found": len(extracted_rows),
+            "debug": payload_debug_summary(payload),
+        })
+
+        if extracted_rows:
+            rows = extracted_rows
+            selected_payload = payload
+            selected_source = source_name
+            selected_url = url
+            selected_params = params
+            break
+
+        # Keep the last payload for debugging even if no rows were found.
+        selected_payload = payload
+        selected_source = source_name
+        selected_url = url
+        selected_params = params
+
     now = datetime.utcnow()
 
     # Replace the chart snapshot atomically enough for this small table.
@@ -1039,7 +1140,7 @@ def sync_tiktok_chart(
                 title=title,
                 artist=clean_text(str(item.get("artist") or "")),
                 creates=item.get("creates") if isinstance(item.get("creates"), int) else None,
-                source="chartex",
+                source=f"chartex:{selected_source}",
                 fetched_at=now,
                 raw_json=json.dumps(item.get("raw") or item, ensure_ascii=False)[:15000],
             )
@@ -1053,9 +1154,11 @@ def sync_tiktok_chart(
         "country_label": country_info["name"],
         "view": normalized_view,
         "period": period,
-        "url": url,
-        "params": params,
+        "source": selected_source,
+        "url": selected_url,
+        "params": selected_params,
         "saved_rows": saved,
+        "attempts": attempts,
         "fetched_at": now.isoformat() + "Z",
     }
 
