@@ -10,13 +10,20 @@ from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter(prefix="/api/trends", tags=["Trends"])
 
-KWORB_GLOBAL_WEEKLY_URL = "https://kworb.net/spotify/country/global_weekly.html"
 CACHE_TTL_SECONDS = 30 * 60
 
-_CACHE: dict[str, Any] = {
-    "fetched_at": 0.0,
-    "payload": None,
+SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
+    "us": {"name": "US", "spotify": "us", "youtube": "us"},
+    "gb": {"name": "UK", "spotify": "gb", "youtube": "gb"},
+    "au": {"name": "Australia", "spotify": "au", "youtube": "au"},
+    "de": {"name": "Germany", "spotify": "de", "youtube": "de"},
+    "fr": {"name": "France", "spotify": "fr", "youtube": "fr"},
+    "br": {"name": "Brazil", "spotify": "br", "youtube": "br"},
+    "es": {"name": "Spain", "spotify": "es", "youtube": "es"},
+    "it": {"name": "Italy", "spotify": "it", "youtube": "it"},
 }
+
+CACHE: dict[str, dict[str, Any]] = {}
 
 
 class KworbTableParser(HTMLParser):
@@ -60,98 +67,233 @@ def clean_text(value: str) -> str:
 def parse_int(value: str | None) -> int | None:
     if value is None:
         return None
-
     cleaned = clean_text(value).replace(",", "")
     if cleaned in {"", "-", "="}:
         return None
-
     cleaned = re.sub(r"[^\d-]", "", cleaned)
     if cleaned in {"", "-"}:
         return None
-
     try:
         return int(cleaned)
     except ValueError:
         return None
 
 
-def parse_position_change(value: str | None) -> str:
-    if not value:
-        return "="
-    cleaned = clean_text(value)
-    return cleaned or "="
-
-
 def split_artist_title(value: str) -> tuple[str, str]:
     text = clean_text(value)
     if " - " not in text:
         return "", text
-
     artist, title = text.split(" - ", 1)
     return clean_text(artist), clean_text(title)
 
 
-def extract_chart_date(html: str) -> str | None:
-    match = re.search(r"Spotify Weekly Chart\s*-\s*Global\s*-\s*(\d{4}/\d{2}/\d{2})", html)
+def detect_chart_date(html: str) -> str | None:
+    match = re.search(r"(\d{4}/\d{2}/\d{2})", html)
     if not match:
         return None
     return match.group(1).replace("/", "-")
 
 
-def row_to_record(cells: list[str]) -> dict[str, Any] | None:
-    # Expected Kworb columns:
-    # Pos / P+ / Artist and Title / Wks / Pk(x?) / Streams / Streams+ / Total
-    if len(cells) < 8:
-        return None
+def build_source(platform: str, view: str, country: str | None) -> dict[str, str]:
+    platform = platform.lower().strip()
+    view = view.lower().strip()
+    country = (country or "us").lower().strip()
 
+    if country == "global":
+        country_info = {"name": "Global", "spotify": "global", "youtube": "global"}
+    elif country in SUPPORTED_COUNTRIES:
+        country_info = SUPPORTED_COUNTRIES[country]
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported country.")
+
+    if platform == "spotify":
+        spotify_country = country_info["spotify"]
+        if view == "weekly_country":
+            return {
+                "title": f"Spotify Weekly Chart - {country_info['name']}",
+                "url": f"https://kworb.net/spotify/country/{spotify_country}_weekly.html",
+            }
+        if view == "daily_country":
+            return {
+                "title": f"Spotify Daily Chart - {country_info['name']}",
+                "url": f"https://kworb.net/spotify/country/{spotify_country}_daily.html",
+            }
+        if view == "us_weekly":
+            return {
+                "title": "Spotify Weekly Chart - US",
+                "url": "https://kworb.net/spotify/country/us_weekly.html",
+            }
+        if view == "us_daily":
+            return {
+                "title": "Spotify Daily Chart - US",
+                "url": "https://kworb.net/spotify/country/us_daily.html",
+            }
+
+    if platform == "youtube":
+        youtube_country = country_info["youtube"]
+        if view == "weekly_country":
+            return {
+                "title": f"YouTube Weekly Chart - {country_info['name']}",
+                "url": f"https://kworb.net/youtube/insights/{youtube_country}.html",
+            }
+        if view == "daily_country":
+            return {
+                "title": f"YouTube Daily Chart - {country_info['name']}",
+                "url": f"https://kworb.net/youtube/insights/{youtube_country}_daily.html",
+            }
+        if view == "us_weekly":
+            return {
+                "title": "YouTube Weekly Chart - US",
+                "url": "https://kworb.net/youtube/insights/us.html",
+            }
+        if view == "us_daily":
+            return {
+                "title": "YouTube Daily Chart - US",
+                "url": "https://kworb.net/youtube/insights/us_daily.html",
+            }
+
+    if platform == "aggregate":
+        # Aggregate is global only. Kworb's current charts page combines multiple platforms
+        # and countries as a global overview.
+        return {
+            "title": "Aggregate Global Current Charts",
+            "url": "https://kworb.net/charts/index_a.html",
+        }
+
+    raise HTTPException(status_code=400, detail="Unsupported trends source.")
+
+
+def spotify_record(cells: list[str]) -> dict[str, Any] | None:
+    # Pos / P+ / Artist and Title / Days|Wks / Pk / Streams / Streams+ / 7Day? / 7Day+? / Total?
+    if len(cells) < 7:
+        return None
     position = parse_int(cells[0])
     artist, title = split_artist_title(cells[2])
-
     if position is None or not title:
         return None
 
     return {
         "position": position,
-        "position_change": parse_position_change(cells[1]),
+        "position_change": clean_text(cells[1]) or "=",
         "artist": artist,
         "title": title,
-        "weeks": parse_int(cells[3]),
-        "peak": clean_text(cells[4]),
-        "streams": parse_int(cells[5]),
-        "streams_change": parse_int(cells[6]),
-        "total_streams": parse_int(cells[7]),
+        "metric_label": "Streams",
+        "metric_value": parse_int(cells[5]),
+        "metric_change": parse_int(cells[6]),
+        "extra_1_label": "Days/Weeks",
+        "extra_1_value": clean_text(cells[3]),
+        "extra_2_label": "Peak",
+        "extra_2_value": clean_text(cells[4]),
+        "total_label": "Total",
+        "total_value": parse_int(cells[-1]),
+        "raw": cells,
     }
 
 
-def parse_kworb_html(html: str, limit: int) -> dict[str, Any]:
+def youtube_record(cells: list[str]) -> dict[str, Any] | None:
+    # Kworb YouTube insights pages vary slightly, but usually include:
+    # Pos / P+ / Title / Days / Pk / Views / Views+
+    if len(cells) < 5:
+        return None
+
+    position = parse_int(cells[0])
+    if position is None:
+        return None
+
+    # Find the first meaningful text cell that is not a small number/movement.
+    title_index = 2 if len(cells) > 2 else 1
+    artist, title = split_artist_title(cells[title_index])
+    if not title:
+        return None
+
+    # Last numeric cells are usually views/change.
+    numeric_values = [parse_int(cell) for cell in cells]
+    numeric_present = [value for value in numeric_values if value is not None]
+
+    metric_value = numeric_present[-2] if len(numeric_present) >= 2 else (numeric_present[-1] if numeric_present else None)
+    metric_change = numeric_present[-1] if len(numeric_present) >= 2 else None
+
+    return {
+        "position": position,
+        "position_change": clean_text(cells[1]) if len(cells) > 1 else "=",
+        "artist": artist,
+        "title": title,
+        "metric_label": "Views",
+        "metric_value": metric_value,
+        "metric_change": metric_change,
+        "extra_1_label": "Days/Weeks",
+        "extra_1_value": clean_text(cells[3]) if len(cells) > 3 else "",
+        "extra_2_label": "Peak",
+        "extra_2_value": clean_text(cells[4]) if len(cells) > 4 else "",
+        "total_label": "Total",
+        "total_value": None,
+        "raw": cells,
+    }
+
+
+def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
+    # Current Charts page does not have one fixed chart schema.
+    # Return a clean row from the available cells so the UI can still display it.
+    if len(cells) < 2:
+        return None
+
+    position = parse_int(cells[0])
+    if position is None:
+        return None
+
+    title_cell = ""
+    for cell in cells[1:]:
+        if clean_text(cell) and parse_int(cell) is None and clean_text(cell) not in {"=", "NEW"}:
+            title_cell = clean_text(cell)
+            break
+
+    if not title_cell:
+        return None
+
+    artist, title = split_artist_title(title_cell)
+
+    return {
+        "position": position,
+        "position_change": clean_text(cells[1]) if len(cells) > 1 else "=",
+        "artist": artist,
+        "title": title,
+        "metric_label": "Score",
+        "metric_value": parse_int(cells[-1]),
+        "metric_change": None,
+        "extra_1_label": "Platform",
+        "extra_1_value": "All",
+        "extra_2_label": "Scope",
+        "extra_2_value": "Global",
+        "total_label": "Raw",
+        "total_value": None,
+        "raw": cells,
+    }
+
+
+def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
     parser = KworbTableParser()
     parser.feed(html)
 
     records: list[dict[str, Any]] = []
+    parser_fn = spotify_record
+    if platform == "youtube":
+        parser_fn = youtube_record
+    elif platform == "aggregate":
+        parser_fn = aggregate_record
 
     for row in parser.rows:
-        record = row_to_record(row)
+        record = parser_fn(row)
         if record:
             records.append(record)
 
-    if not records:
-        raise ValueError("Could not find chart rows in Kworb response.")
-
-    chart_date = extract_chart_date(html)
-
-    return {
-        "source": "Kworb Spotify Weekly Chart - Global",
-        "source_url": KWORB_GLOBAL_WEEKLY_URL,
-        "chart_date": chart_date,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "count": min(len(records), limit),
-        "rows": records[:limit],
-    }
+    return records[:limit]
 
 
-def fetch_kworb_trends(limit: int) -> dict[str, Any]:
+def fetch_chart(platform: str, view: str, country: str | None, limit: int) -> dict[str, Any]:
+    source = build_source(platform, view, country)
+
     response = requests.get(
-        KWORB_GLOBAL_WEEKLY_URL,
+        source["url"],
         timeout=30,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; SpotifyGrowthHub/1.0; +https://nerd-engine.vercel.app)",
@@ -159,37 +301,62 @@ def fetch_kworb_trends(limit: int) -> dict[str, Any]:
         },
     )
     response.raise_for_status()
-    return parse_kworb_html(response.text, limit=limit)
+
+    rows = parse_html(response.text, platform=platform, limit=limit)
+    if not rows:
+        raise ValueError("Could not find chart rows in Kworb response.")
+
+    return {
+        "platform": platform,
+        "view": view,
+        "country": country,
+        "title": source["title"],
+        "source_url": source["url"],
+        "chart_date": detect_chart_date(response.text),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(rows),
+        "rows": rows,
+    }
 
 
-@router.get("/spotify-global-weekly")
-def get_spotify_global_weekly(
+@router.get("/chart")
+def get_chart(
+    platform: str = Query(default="spotify", pattern="^(spotify|youtube|aggregate)$"),
+    view: str = Query(default="weekly_country"),
+    country: str = Query(default="us"),
     limit: int = Query(default=200, ge=1, le=500),
     refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
+    cache_key = f"{platform}:{view}:{country}:{limit}"
+    cached = CACHE.get(cache_key)
     now = time.time()
-    cached_payload = _CACHE.get("payload")
-    fetched_at = float(_CACHE.get("fetched_at") or 0)
 
-    if not refresh and cached_payload and now - fetched_at < CACHE_TTL_SECONDS:
-        payload = dict(cached_payload)
+    if not refresh and cached and now - float(cached["cached_at"]) < CACHE_TTL_SECONDS:
+        payload = dict(cached["payload"])
         payload["cached"] = True
-        payload["rows"] = payload["rows"][:limit]
-        payload["count"] = len(payload["rows"])
         return payload
 
     try:
-        payload = fetch_kworb_trends(limit=max(limit, 500))
+        payload = fetch_chart(platform, view, country, limit)
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch Kworb trends: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Could not fetch Kworb chart: {exc}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    _CACHE["fetched_at"] = now
-    _CACHE["payload"] = payload
+    CACHE[cache_key] = {"cached_at": now, "payload": payload}
+    payload["cached"] = False
+    return payload
 
-    returned = dict(payload)
-    returned["cached"] = False
-    returned["rows"] = returned["rows"][:limit]
-    returned["count"] = len(returned["rows"])
-    return returned
+
+@router.get("/spotify-global-weekly")
+def legacy_spotify_global_weekly(
+    limit: int = Query(default=200, ge=1, le=500),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    return get_chart(
+        platform="spotify",
+        view="weekly_country",
+        country="global",
+        limit=limit,
+        refresh=refresh,
+    )
