@@ -216,7 +216,7 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
         if view == "global_trending_weekly":
             return {
                 "title": "YouTube Global Trending Weekly",
-                "url": "https://kworb.net/youtube/insights/",
+                "url": "https://kworb.net/youtube/trending.html",
             }
 
         if view == "us_trending_daily":
