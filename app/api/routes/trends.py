@@ -1225,8 +1225,6 @@ def tiktok_sync_targets(country: str | None = None) -> list[tuple[str, str]]:
             ("daily_country", normalized_country),
         ]
 
-    # Only sync the four visible TikTok cards:
-    # Global Weekly, Global Daily, US Weekly, US Daily.
     return [
         ("weekly_country", "worldwide"),
         ("daily_country", "worldwide"),
