@@ -235,6 +235,12 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
             }
 
     if platform == "youtube":
+        if view == "global_trending_weekly":
+            return {
+                "title": "YouTube Global Weekly",
+                "url": "https://kworb.net/youtube/trending.html",
+            }
+
         if view == "global_daily":
             return {
                 "title": "YouTube Global Daily",
@@ -247,22 +253,16 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
                 "url": "https://kworb.net/youtube/insights/us.html",
             }
 
-        if view == "global_trending_weekly":
-            return {
-                "title": "YouTube Global Trending Weekly",
-                "url": "https://kworb.net/youtube/trending.html",
-            }
-
         if view == "us_trending_daily":
             return {
-                "title": "YouTube US Trending Daily",
+                "title": "YouTube US Daily",
                 "url": "https://kworb.net/youtube/trending/us.html",
             }
 
         code = country_info["youtube"]
 
         if code == "global":
-            raise HTTPException(status_code=400, detail="Use global_daily or global_trending_weekly for YouTube global charts.")
+            raise HTTPException(status_code=400, detail="Use global_trending_weekly or global_daily for YouTube global charts.")
 
         if view == "weekly_country":
             return {
