@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
 
@@ -22,7 +22,6 @@ CHARTEX_API_KEY = os.getenv("CHARTEX_API_KEY", "")
 CHARTEX_APP_ID = os.getenv("CHARTEX_APP_ID", "")
 CHARTEX_APP_TOKEN = os.getenv("CHARTEX_APP_TOKEN", "")
 CHARTEX_MIN_VALUE = int(os.getenv("CHARTEX_MIN_VALUE", "0"))
-CHARTEX_SYNC_TTL_HOURS = int(os.getenv("CHARTEX_SYNC_TTL_HOURS", "7"))
 
 
 class TikTokTrendRow(Base):
@@ -1049,42 +1048,10 @@ def get_tiktok_chart_from_db(
     }
 
 
-def get_existing_tiktok_snapshot(
-    db: Session,
-    view: str,
-    country: str,
-) -> tuple[int, datetime | None]:
-    count = (
-        db.query(TikTokTrendRow)
-        .filter(TikTokTrendRow.country == country)
-        .filter(TikTokTrendRow.view == view)
-        .count()
-    )
-
-    latest_row = (
-        db.query(TikTokTrendRow)
-        .filter(TikTokTrendRow.country == country)
-        .filter(TikTokTrendRow.view == view)
-        .order_by(TikTokTrendRow.fetched_at.desc())
-        .first()
-    )
-
-    return count, latest_row.fetched_at if latest_row else None
-
-
-def is_tiktok_snapshot_fresh(latest: datetime | None) -> bool:
-    if latest is None:
-        return False
-
-    return latest >= datetime.utcnow() - timedelta(hours=CHARTEX_SYNC_TTL_HOURS)
-
-
-
 def sync_tiktok_chart(
     db: Session,
     view: str,
     country: str,
-    force: bool = False,
 ) -> dict[str, Any]:
     normalized_view = normalize_tiktok_view(view)
     normalized_country = country.lower().strip()
@@ -1098,24 +1065,6 @@ def sync_tiktok_chart(
     country_info = TIKTOK_COUNTRIES[normalized_country]
     period = tiktok_period_for_view(normalized_view)
     country_code = country_info.get("code", "")
-
-    existing_count, latest_snapshot = get_existing_tiktok_snapshot(
-        db,
-        normalized_view,
-        normalized_country,
-    )
-
-    if not force and existing_count > 0 and is_tiktok_snapshot_fresh(latest_snapshot):
-        return {
-            "country": normalized_country,
-            "country_label": country_info["name"],
-            "view": normalized_view,
-            "period": period,
-            "saved_rows": existing_count,
-            "skipped": True,
-            "reason": f"Fresh database snapshot exists within {CHARTEX_SYNC_TTL_HOURS} hours.",
-            "fetched_at": latest_snapshot.isoformat() + "Z" if latest_snapshot else None,
-        }
 
     attempts: list[dict[str, Any]] = []
 
@@ -1209,7 +1158,6 @@ def sync_tiktok_chart(
         "url": selected_url,
         "params": selected_params,
         "saved_rows": saved,
-        "skipped": False,
         "attempts": attempts,
         "fetched_at": now.isoformat() + "Z",
     }
@@ -1233,10 +1181,73 @@ def tiktok_sync_targets(country: str | None = None) -> list[tuple[str, str]]:
     ]
 
 
+def fetch_chart(platform: str, view: str, country: str | None, limit: int, refresh: bool, db: Session | None = None) -> dict[str, Any]:
+    if platform.lower().strip() == "tiktok":
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database session is required for TikTok trends.")
+        return get_tiktok_chart_from_db(db, view, country, limit)
+
+    source = build_source(platform, view, country)
+    source_url = source["url"]
+
+    # Important: cache must include platform AND final source URL.
+    # This prevents Spotify and YouTube cards with the same country/view from sharing data.
+    cache_key = f"{platform.lower()}::{view.lower()}::{(country or '').lower()}::{source_url}"
+
+    now = datetime.utcnow()
+    cached = CACHE.get(cache_key)
+
+    if cached and not refresh:
+        age = now - cached["fetched_at_dt"]
+        if age.total_seconds() < CACHE_TTL_SECONDS:
+            return cached["payload"]
+
+    html = fetch_html(source_url)
+    rows = parse_html(html, platform.lower(), limit)
+
+    payload = {
+        "platform": platform.lower(),
+        "view": view.lower(),
+        "country": (country or "").lower(),
+        "title": source["title"],
+        "source_url": source_url,
+        "fetched_at": now.isoformat() + "Z",
+        "rows": rows,
+    }
+
+    CACHE[cache_key] = {
+        "fetched_at_dt": now,
+        "payload": payload,
+    }
+
+    return payload
+
+
+@router.get("/chart")
+def get_chart(
+    platform: str = Query(default="spotify", pattern="^(spotify|youtube|aggregate|tiktok)$"),
+    view: str = Query(default="weekly_country"),
+    country: str = Query(default="us"),
+    limit: int = Query(default=100, ge=1, le=500),
+    refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        payload = fetch_chart(platform, view, country, limit, refresh, db)
+        payload = dict(payload)
+        payload["cached"] = not refresh
+        return payload
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch chart source: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Trends route error: {type(exc).__name__}: {exc}") from exc
+
+
 @router.post("/tiktok/sync")
 def sync_tiktok_trends(
     country: str = Query(default="all"),
-    force: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
@@ -1244,7 +1255,7 @@ def sync_tiktok_trends(
 
     for view, target_country in tiktok_sync_targets(country):
         try:
-            results.append(sync_tiktok_chart(db, view, target_country, force=force))
+            results.append(sync_tiktok_chart(db, view, target_country))
         except Exception as exc:
             errors.append({
                 "country": target_country,
@@ -1255,9 +1266,6 @@ def sync_tiktok_trends(
     return {
         "ok": len(errors) == 0,
         "synced": results,
-        "skipped_count": sum(1 for item in results if item.get("skipped")),
-        "request_count": sum(1 for item in results if not item.get("skipped")),
-        "ttl_hours": CHARTEX_SYNC_TTL_HOURS,
         "errors": errors,
     }
 
@@ -1265,10 +1273,9 @@ def sync_tiktok_trends(
 @router.get("/tiktok/sync")
 def sync_tiktok_trends_get(
     country: str = Query(default="all"),
-    force: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return sync_tiktok_trends(country=country, force=force, db=db)
+    return sync_tiktok_trends(country=country, db=db)
 
 
 
