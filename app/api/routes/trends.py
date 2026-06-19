@@ -586,25 +586,17 @@ def get_chart(
     limit: int = Query(default=100, ge=1, le=500),
     refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
-    cache_key = f"{platform}:{view}:{country}:{limit}"
-    cached = CACHE.get(cache_key)
-    now = time.time()
-
-    if not refresh and cached and now - float(cached["cached_at"]) < CACHE_TTL_SECONDS:
-        payload = dict(cached["payload"])
-        payload["cached"] = True
-        return payload
-
     try:
-        payload = fetch_chart(platform, view, country, limit)
+        payload = fetch_chart(platform, view, country, limit, refresh)
+        payload = dict(payload)
+        payload["cached"] = not refresh
+        return payload
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch Kworb chart: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    CACHE[cache_key] = {"cached_at": now, "payload": payload}
-    payload["cached"] = False
-    return payload
+        raise HTTPException(status_code=502, detail=f"Could not fetch chart source: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trends route error: {exc}") from exc
 
 
 @router.get("/spotify-global-weekly")
