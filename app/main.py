@@ -1,22 +1,28 @@
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import spotify_public
-from app.api.routes import curation_history
-from app.api.routes import curation_csv_playlists
-from app.api.routes import ads_settings
-from app.api.routes import ads_filter_options
-from app.api.routes import artist_library
-from app.api.routes.song_metrics import router as song_metrics_router
-from app.api.routes import settings
-from app.api.routes import production_smart_segments
-from app.api.routes import production_mashups
-from app.api.routes import scheduling
-from app.api.routes import sync_status
-from app.api.routes import trends
 
 from app.core.database import Base, engine
-from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
+
+from app.api.routes import accounts
+from app.api.routes import ads_filter_options
+from app.api.routes import ads_settings
+from app.api.routes import artist_library
+from app.api.routes import curation
+from app.api.routes import curation_csv_playlists
+from app.api.routes import curation_history
+from app.api.routes import curation_storage
+from app.api.routes import playlist_manager_state
+from app.api.routes import playlists
+from app.api.routes import production_mashups
+from app.api.routes import production_smart_segments
+from app.api.routes import scheduling
+from app.api.routes import settings
+from app.api.routes import spotify_auth
+from app.api.routes import spotify_public
+from app.api.routes import sync_status
+from app.api.routes import trends
+from app.api.routes.song_metrics import router as song_metrics_router
 
 load_dotenv()
 
@@ -35,8 +41,10 @@ app.add_middleware(
         "https://nerd-engine-96ldpmfe2-wissammantoufeh-5383s-projects.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
     ],
-    allow_origin_regex=r"https://.*\\.vercel\\.app|http://localhost:3000|http://127\\.0\\.0\\.1:3000",
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,3 +69,8 @@ app.include_router(production_mashups.router)
 app.include_router(scheduling.router)
 app.include_router(sync_status.router)
 app.include_router(trends.router)
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Spotify Growth Hub API"}
