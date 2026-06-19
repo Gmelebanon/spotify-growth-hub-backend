@@ -25,6 +25,18 @@ SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
 }
 
 
+
+AGGREGATE_COUNTRY_ORDER = {
+    "US": 1,
+    "UK": 2,
+    "Australia": 3,
+    "Germany": 4,
+    "France": 5,
+    "Brazil": 6,
+    "Spain": 7,
+    "Italy": 8,
+}
+
 AGGREGATE_ALLOWED_COUNTRIES = {
     "United States": "US",
     "United Kingdom": "UK",
@@ -623,6 +635,12 @@ def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
         record = parser_fn(row)
         if record:
             rows.append(record)
+
+    if platform == "aggregate":
+        rows = sorted(
+            rows,
+            key=lambda row: AGGREGATE_COUNTRY_ORDER.get(str(row.get("country", "")), 999),
+        )
 
     return rows[:limit]
 
