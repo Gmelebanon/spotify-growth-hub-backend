@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -5,12 +6,45 @@ from html.parser import HTMLParser
 from typing import Any
 
 import requests
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import Session
+
+from app.core.database import Base, get_db
 
 
 router = APIRouter(prefix="/api/trends", tags=["Trends"])
 
 CACHE_TTL_SECONDS = 30 * 60
+
+CHARTEX_API_BASE_URL = os.getenv("CHARTEX_API_BASE_URL", "https://api.chartex.com")
+CHARTEX_API_KEY = os.getenv("CHARTEX_API_KEY", "")
+CHARTEX_APP_ID = os.getenv("CHARTEX_APP_ID", "")
+CHARTEX_APP_TOKEN = os.getenv("CHARTEX_APP_TOKEN", "")
+CHARTEX_MIN_VALUE = int(os.getenv("CHARTEX_MIN_VALUE", "10000"))
+
+
+class TikTokTrendRow(Base):
+    __tablename__ = "tiktok_trend_rows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    country = Column(String(64), nullable=False, index=True)
+    country_label = Column(String(80), nullable=False)
+    view = Column(String(40), nullable=False, index=True)
+    period = Column(String(24), nullable=False)
+    position = Column(Integer, nullable=False)
+    title = Column(Text, nullable=False)
+    artist = Column(Text, nullable=True)
+    creates = Column(Integer, nullable=True)
+    source = Column(String(80), nullable=False, default="chartex")
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    raw_json = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("country", "view", "position", name="uq_tiktok_trends_country_view_position"),
+    )
+
+
 
 SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
     "global": {"name": "Global", "spotify": "global", "youtube": "global"},
@@ -23,7 +57,6 @@ SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
     "es": {"name": "Spain", "spotify": "es", "youtube": "es"},
     "it": {"name": "Italy", "spotify": "it", "youtube": "it"},
 }
-
 
 
 AGGREGATE_COUNTRY_ORDER = {
@@ -49,16 +82,16 @@ AGGREGATE_ALLOWED_COUNTRIES = {
 }
 
 TIKTOK_COUNTRIES: dict[str, dict[str, str]] = {
-    "worldwide": {"name": "Worldwide", "slug": "worldwide"},
-    "global": {"name": "Worldwide", "slug": "worldwide"},
-    "us": {"name": "US", "slug": "united-states"},
-    "gb": {"name": "UK", "slug": "united-kingdom"},
-    "au": {"name": "Australia", "slug": "australia"},
-    "de": {"name": "Germany", "slug": "germany"},
-    "fr": {"name": "France", "slug": "france"},
-    "br": {"name": "Brazil", "slug": "brazil"},
-    "es": {"name": "Spain", "slug": "spain"},
-    "it": {"name": "Italy", "slug": "italy"},
+    "worldwide": {"name": "Worldwide", "slug": "worldwide", "code": ""},
+    "global": {"name": "Worldwide", "slug": "worldwide", "code": ""},
+    "us": {"name": "US", "slug": "united-states", "code": "US"},
+    "gb": {"name": "UK", "slug": "united-kingdom", "code": "GB"},
+    "au": {"name": "Australia", "slug": "australia", "code": "AU"},
+    "de": {"name": "Germany", "slug": "germany", "code": "DE"},
+    "fr": {"name": "France", "slug": "france", "code": "FR"},
+    "br": {"name": "Brazil", "slug": "brazil", "code": "BR"},
+    "es": {"name": "Spain", "slug": "spain", "code": "ES"},
+    "it": {"name": "Italy", "slug": "italy", "code": "IT"},
 }
 
 CACHE: dict[str, dict[str, Any]] = {}
@@ -361,7 +394,6 @@ def youtube_record(cells: list[str]) -> dict[str, Any] | None:
     }
 
 
-
 def aggregate_country_alias(value: str) -> str | None:
     cleaned = clean_text(value)
 
@@ -425,62 +457,6 @@ def parse_aggregate_html(html: str, limit: int) -> list[dict[str, Any]]:
         record = make_aggregate_row(cells)
         if record:
             rows.append(record)
-
-    # Fallback for pages where rows are exposed in rendered text but not captured
-    # by the simple table parser.
-    if not rows:
-        # Remove scripts/styles and convert tags to line breaks so country rows
-        # and song cells remain parseable.
-        cleaned_html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-        cleaned_html = re.sub(r"<style.*?</style>", " ", cleaned_html, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "\n", cleaned_html)
-        lines = [clean_text(line) for line in text.splitlines()]
-        lines = [line for line in lines if line]
-
-        allowed_full_names = [
-            "United States",
-            "United Kingdom",
-            "Australia",
-            "Germany",
-            "France",
-            "Brazil",
-            "Spain",
-            "Italy",
-        ]
-
-        for index, line in enumerate(lines):
-            display_country = aggregate_country_alias(line)
-            if not display_country or line not in allowed_full_names:
-                continue
-
-            values: list[str] = []
-            pointer = index + 1
-            while pointer < len(lines) and len(values) < 6:
-                candidate = lines[pointer]
-                pointer += 1
-
-                if aggregate_country_alias(candidate):
-                    break
-
-                if candidate.lower() in {
-                    "country",
-                    "itunes",
-                    "spotify",
-                    "apple music",
-                    "youtube",
-                    "shazam",
-                    "deezer",
-                    "main countries:",
-                    "other countries:",
-                }:
-                    continue
-
-                values.append(candidate)
-
-            if len(values) >= 6:
-                record = make_aggregate_row([line, *values[:6]])
-                if record:
-                    rows.append(record)
 
     deduped: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -720,17 +696,397 @@ def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
         if record:
             rows.append(record)
 
-    if platform == "aggregate":
-        rows = sorted(
-            rows,
-            key=lambda row: AGGREGATE_COUNTRY_ORDER.get(str(row.get("country", "")), 999),
-        )
-
     return rows[:limit]
 
 
 
-def fetch_chart(platform: str, view: str, country: str | None, limit: int, refresh: bool) -> dict[str, Any]:
+def tiktok_period_for_view(view: str) -> str:
+    return "7-days" if view in {"weekly_country", "us_weekly"} else "1-day"
+
+
+def normalize_tiktok_view(view: str) -> str:
+    if view in {"us_weekly", "weekly", "global_weekly"}:
+        return "weekly_country"
+    if view in {"us_daily", "daily", "global_daily"}:
+        return "daily_country"
+    return view
+
+
+def chartex_sounds_url() -> str:
+    return f"{CHARTEX_API_BASE_URL.rstrip('/')}/external/v1/tiktok-sounds/"
+
+
+def chartex_sort_by_for_view(view: str) -> str:
+    normalized_view = normalize_tiktok_view(view)
+    if normalized_view == "daily_country":
+        return "tiktok_last_24_hours_video_count"
+    return "tiktok_last_7_days_video_count"
+
+
+def chartex_params(view: str, country_code: str) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "sort_by": chartex_sort_by_for_view(view),
+        "page": 1,
+        "limit": 100,
+        "min_value": CHARTEX_MIN_VALUE,
+        "only_music": "true",
+    }
+
+    # Chartex docs say leaving country_codes empty returns worldwide.
+    if country_code:
+        params["country_codes"] = country_code
+
+    return params
+
+
+def chartex_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "NerdEngineTrends/1.0",
+    }
+
+    # Chartex may provide either a single API key or an App ID + App Token pair.
+    # Keep multiple common header names so this works with the most common API-gateway styles.
+    if CHARTEX_API_KEY:
+        headers["Authorization"] = f"Bearer {CHARTEX_API_KEY}"
+        headers["x-api-key"] = CHARTEX_API_KEY
+
+    if CHARTEX_APP_ID:
+        headers["x-app-id"] = CHARTEX_APP_ID
+        headers["app-id"] = CHARTEX_APP_ID
+        headers["X-App-Id"] = CHARTEX_APP_ID
+
+    if CHARTEX_APP_TOKEN:
+        headers["x-app-token"] = CHARTEX_APP_TOKEN
+        headers["app-token"] = CHARTEX_APP_TOKEN
+        headers["X-App-Token"] = CHARTEX_APP_TOKEN
+
+        # Some APIs expect the token as a bearer token even when they call it an app token.
+        if not CHARTEX_API_KEY:
+            headers["Authorization"] = f"Bearer {CHARTEX_APP_TOKEN}"
+
+    return headers
+
+
+def value_from_keys(data: dict[str, Any], keys: list[str]) -> Any:
+    lower = {str(key).lower(): value for key, value in data.items()}
+    for key in keys:
+        if key.lower() in lower and lower[key.lower()] not in {None, ""}:
+            return lower[key.lower()]
+    return None
+
+
+def first_nested_string(value: Any, keys: list[str]) -> str:
+    if isinstance(value, dict):
+        found = value_from_keys(value, keys)
+        if found not in {None, ""}:
+            return clean_text(str(found))
+
+        for child in value.values():
+            nested = first_nested_string(child, keys)
+            if nested:
+                return nested
+
+    elif isinstance(value, list):
+        for child in value:
+            nested = first_nested_string(child, keys)
+            if nested:
+                return nested
+
+    return ""
+
+
+def first_nested_int(value: Any, keys: list[str]) -> int | None:
+    if isinstance(value, dict):
+        found = value_from_keys(value, keys)
+        parsed = parse_int(str(found)) if found is not None else None
+        if parsed is not None:
+            return parsed
+
+        for child in value.values():
+            nested = first_nested_int(child, keys)
+            if nested is not None:
+                return nested
+
+    elif isinstance(value, list):
+        for child in value:
+            nested = first_nested_int(child, keys)
+            if nested is not None:
+                return nested
+
+    return None
+
+
+def collect_candidate_lists(value: Any, lists: list[list[dict[str, Any]]]) -> None:
+    if isinstance(value, list):
+        dict_items = [item for item in value if isinstance(item, dict)]
+        if dict_items:
+            lists.append(dict_items)
+
+        for item in value:
+            collect_candidate_lists(item, lists)
+
+    elif isinstance(value, dict):
+        for child in value.values():
+            collect_candidate_lists(child, lists)
+
+
+def tiktok_item_to_row(item: dict[str, Any], fallback_position: int) -> dict[str, Any] | None:
+    title = first_nested_string(
+        item,
+        [
+            "title",
+            "song_title",
+            "songTitle",
+            "track_title",
+            "trackTitle",
+            "name",
+            "sound_title",
+            "soundTitle",
+        ],
+    )
+
+    artist = first_nested_string(
+        item,
+        [
+            "artist",
+            "artist_name",
+            "artistName",
+            "author",
+            "author_name",
+            "authorName",
+            "creator",
+            "creator_name",
+            "performer",
+        ],
+    )
+
+    if not title:
+        return None
+
+    position = first_nested_int(item, ["rank", "position", "chart_position", "chartPosition"])
+    if position is None:
+        position = fallback_position
+
+    creates = first_nested_int(
+        item,
+        [
+            "tiktok_last_24_hours_video_count",
+            "tiktok_last_7_days_video_count",
+            "tiktok_total_video_count",
+            "total_sound_count",
+            "sound_count",
+            "sounds_count",
+            "video_count",
+            "videos_count",
+            "count",
+            "value",
+        ],
+    )
+
+    return {
+        "position": position,
+        "title": title,
+        "artist": artist,
+        "creates": creates,
+        "raw": item,
+    }
+
+
+def extract_chartex_rows(payload: Any) -> list[dict[str, Any]]:
+    candidate_lists: list[list[dict[str, Any]]] = []
+    collect_candidate_lists(payload, candidate_lists)
+
+    best_rows: list[dict[str, Any]] = []
+
+    for candidate_list in candidate_lists:
+        rows: list[dict[str, Any]] = []
+        for index, item in enumerate(candidate_list, start=1):
+            row = tiktok_item_to_row(item, index)
+            if row:
+                rows.append(row)
+
+        if len(rows) > len(best_rows):
+            best_rows = rows
+
+    deduped: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for row in best_rows:
+        key = (
+            int(row.get("position") or 0),
+            str(row.get("title") or ""),
+            str(row.get("artist") or ""),
+        )
+        if key[0] > 0 and key[1]:
+            deduped[key] = row
+
+    return sorted(deduped.values(), key=lambda item: int(item.get("position") or 999999))
+
+
+def serialize_tiktok_row(row: TikTokTrendRow) -> dict[str, Any]:
+    return {
+        "position": row.position,
+        "position_change": "=",
+        "artist": row.artist or "",
+        "title": row.title,
+        "metric_label": "Creates",
+        "metric_value": row.creates,
+        "metric_change": None,
+        "extra_1_label": "Source",
+        "extra_1_value": "Chartex DB",
+        "extra_2_label": "Scope",
+        "extra_2_value": row.country_label,
+        "total_label": "Total",
+        "total_value": None,
+        "country": row.country,
+        "view": row.view,
+        "fetched_at": row.fetched_at.isoformat() + "Z" if row.fetched_at else None,
+        "raw": [],
+    }
+
+
+def get_tiktok_chart_from_db(
+    db: Session,
+    view: str,
+    country: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    normalized_view = normalize_tiktok_view(view)
+    normalized_country = (country or "worldwide").lower().strip()
+
+    if normalized_country == "global":
+        normalized_country = "worldwide"
+
+    if normalized_country not in TIKTOK_COUNTRIES:
+        raise HTTPException(status_code=400, detail="Unsupported TikTok country.")
+
+    country_info = TIKTOK_COUNTRIES[normalized_country]
+
+    rows = (
+        db.query(TikTokTrendRow)
+        .filter(TikTokTrendRow.country == normalized_country)
+        .filter(TikTokTrendRow.view == normalized_view)
+        .order_by(TikTokTrendRow.position.asc())
+        .limit(limit)
+        .all()
+    )
+
+    latest = rows[0].fetched_at if rows else datetime.utcnow()
+
+    return {
+        "platform": "tiktok",
+        "view": normalized_view,
+        "country": normalized_country,
+        "title": f"TikTok Creations - {country_info['name']}",
+        "source_url": "database:tiktok_trend_rows",
+        "fetched_at": latest.isoformat() + "Z",
+        "rows": [serialize_tiktok_row(row) for row in rows],
+    }
+
+
+def sync_tiktok_chart(
+    db: Session,
+    view: str,
+    country: str,
+) -> dict[str, Any]:
+    normalized_view = normalize_tiktok_view(view)
+    normalized_country = country.lower().strip()
+
+    if normalized_country == "global":
+        normalized_country = "worldwide"
+
+    if normalized_country not in TIKTOK_COUNTRIES:
+        raise HTTPException(status_code=400, detail="Unsupported TikTok country.")
+
+    country_info = TIKTOK_COUNTRIES[normalized_country]
+    period = tiktok_period_for_view(normalized_view)
+    url = chartex_sounds_url()
+    params = chartex_params(normalized_view, country_info.get("code", ""))
+
+    response = requests.get(url, headers=chartex_headers(), params=params, timeout=30)
+    response.raise_for_status()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Chartex API did not return JSON.") from exc
+
+    rows = extract_chartex_rows(payload)
+    now = datetime.utcnow()
+
+    # Replace the chart snapshot atomically enough for this small table.
+    (
+        db.query(TikTokTrendRow)
+        .filter(TikTokTrendRow.country == normalized_country)
+        .filter(TikTokTrendRow.view == normalized_view)
+        .delete(synchronize_session=False)
+    )
+
+    import json
+
+    saved = 0
+    for item in rows:
+        title = clean_text(str(item.get("title") or ""))
+        if not title:
+            continue
+
+        db.add(
+            TikTokTrendRow(
+                country=normalized_country,
+                country_label=country_info["name"],
+                view=normalized_view,
+                period=period,
+                position=int(item.get("position") or saved + 1),
+                title=title,
+                artist=clean_text(str(item.get("artist") or "")),
+                creates=item.get("creates") if isinstance(item.get("creates"), int) else None,
+                source="chartex",
+                fetched_at=now,
+                raw_json=json.dumps(item.get("raw") or item, ensure_ascii=False)[:15000],
+            )
+        )
+        saved += 1
+
+    db.commit()
+
+    return {
+        "country": normalized_country,
+        "country_label": country_info["name"],
+        "view": normalized_view,
+        "period": period,
+        "url": url,
+        "params": params,
+        "saved_rows": saved,
+        "fetched_at": now.isoformat() + "Z",
+    }
+
+
+def tiktok_sync_targets(country: str | None = None) -> list[tuple[str, str]]:
+    if country and country.lower().strip() not in {"", "all"}:
+        normalized_country = country.lower().strip()
+        if normalized_country == "global":
+            normalized_country = "worldwide"
+        return [
+            ("weekly_country", normalized_country),
+            ("daily_country", normalized_country),
+        ]
+
+    countries = ["worldwide", "us", "gb", "au", "de", "fr", "br", "es", "it"]
+    targets: list[tuple[str, str]] = []
+
+    for target_country in countries:
+        targets.append(("weekly_country", target_country))
+        targets.append(("daily_country", target_country))
+
+    return targets
+
+
+
+def fetch_chart(platform: str, view: str, country: str | None, limit: int, refresh: bool, db: Session | None = None) -> dict[str, Any]:
+    if platform.lower().strip() == "tiktok":
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database session is required for TikTok trends.")
+        return get_tiktok_chart_from_db(db, view, country, limit)
+
     source = build_source(platform, view, country)
     source_url = source["url"]
 
@@ -774,9 +1130,10 @@ def get_chart(
     country: str = Query(default="us"),
     limit: int = Query(default=100, ge=1, le=500),
     refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     try:
-        payload = fetch_chart(platform, view, country, limit, refresh)
+        payload = fetch_chart(platform, view, country, limit, refresh, db)
         payload = dict(payload)
         payload["cached"] = not refresh
         return payload
@@ -786,6 +1143,40 @@ def get_chart(
         raise HTTPException(status_code=502, detail=f"Could not fetch chart source: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Trends route error: {type(exc).__name__}: {exc}") from exc
+
+
+@router.post("/tiktok/sync")
+def sync_tiktok_trends(
+    country: str = Query(default="all"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for view, target_country in tiktok_sync_targets(country):
+        try:
+            results.append(sync_tiktok_chart(db, view, target_country))
+        except Exception as exc:
+            errors.append({
+                "country": target_country,
+                "view": view,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "ok": len(errors) == 0,
+        "synced": results,
+        "errors": errors,
+    }
+
+
+@router.get("/tiktok/sync")
+def sync_tiktok_trends_get(
+    country: str = Query(default="all"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return sync_tiktok_trends(country=country, db=db)
+
 
 
 @router.get("/spotify-global-weekly")
