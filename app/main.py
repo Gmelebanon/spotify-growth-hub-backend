@@ -13,6 +13,7 @@ from app.api.routes import production_smart_segments
 from app.api.routes import production_mashups
 from app.api.routes import scheduling
 from app.api.routes import sync_status
+from app.api.routes import trends
 
 from app.core.database import Base, engine
 from app.api.routes import accounts, playlists, curation, curation_storage, playlist_manager_state, spotify_auth
@@ -59,3 +60,4 @@ app.include_router(production_smart_segments.router)
 app.include_router(production_mashups.router)
 app.include_router(scheduling.router)
 app.include_router(sync_status.router)
+app.include_router(trends.router)
