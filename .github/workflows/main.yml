@@ -2,6 +2,7 @@ name: Daily Data Sync
 
 on:
   schedule:
+    # GitHub cron uses UTC. 07:00 UTC = 10:00 Beirut during summer.
     - cron: "0 7 * * *"
   workflow_dispatch:
 
@@ -30,5 +31,8 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run sync script
+      - name: Run daily sync
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          SYNC_ENDPOINTS: ${{ secrets.SYNC_ENDPOINTS }}
         run: python scripts/sync.py
