@@ -458,6 +458,62 @@ def parse_aggregate_html(html: str, limit: int) -> list[dict[str, Any]]:
         if record:
             rows.append(record)
 
+    # Fallback for pages where rows are exposed in rendered text but not captured
+    # by the simple table parser.
+    if not rows:
+        # Remove scripts/styles and convert tags to line breaks so country rows
+        # and song cells remain parseable.
+        cleaned_html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_html = re.sub(r"<style.*?</style>", " ", cleaned_html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "\n", cleaned_html)
+        lines = [clean_text(line) for line in text.splitlines()]
+        lines = [line for line in lines if line]
+
+        allowed_full_names = [
+            "United States",
+            "United Kingdom",
+            "Australia",
+            "Germany",
+            "France",
+            "Brazil",
+            "Spain",
+            "Italy",
+        ]
+
+        for index, line in enumerate(lines):
+            display_country = aggregate_country_alias(line)
+            if not display_country or line not in allowed_full_names:
+                continue
+
+            values: list[str] = []
+            pointer = index + 1
+            while pointer < len(lines) and len(values) < 6:
+                candidate = lines[pointer]
+                pointer += 1
+
+                if aggregate_country_alias(candidate):
+                    break
+
+                if candidate.lower() in {
+                    "country",
+                    "itunes",
+                    "spotify",
+                    "apple music",
+                    "youtube",
+                    "shazam",
+                    "deezer",
+                    "main countries:",
+                    "other countries:",
+                }:
+                    continue
+
+                values.append(candidate)
+
+            if len(values) >= 6:
+                record = make_aggregate_row([line, *values[:6]])
+                if record:
+                    rows.append(record)
+
     deduped: dict[str, dict[str, Any]] = {}
     for row in rows:
         country = str(row.get("country", ""))
