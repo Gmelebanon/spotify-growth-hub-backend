@@ -111,6 +111,22 @@ def detect_chart_date(html: str) -> str | None:
     return match.group(1).replace("/", "-")
 
 
+
+def fetch_html(url: str) -> str:
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; NerdEngineTrends/1.0; +https://nerd-engine.vercel.app)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.text
+
+
 def build_source(platform: str, view: str, country: str | None) -> dict[str, str]:
     platform = platform.lower().strip()
     view = view.lower().strip()
@@ -596,7 +612,7 @@ def get_chart(
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch chart source: {exc}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Trends route error: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Trends route error: {type(exc).__name__}: {exc}") from exc
 
 
 @router.get("/spotify-global-weekly")
