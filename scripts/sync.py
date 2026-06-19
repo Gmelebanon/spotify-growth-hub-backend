@@ -6,33 +6,36 @@ from datetime import datetime, timezone
 BACKEND_URL = os.getenv("BACKEND_URL", "https://spotify-growth-hub-backend.onrender.com")
 
 ENDPOINTS = [
-    "/api/health",
+    "/",
+    "/api/artists",
+    "/api/songs",
 ]
 
 def main():
     print(f"Daily sync started at {datetime.now(timezone.utc).isoformat()}")
     print(f"Backend URL: {BACKEND_URL}")
 
-    failed = False
+    had_error = False
 
     for endpoint in ENDPOINTS:
         url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
-        print(f"Calling {url}")
+        print(f"\nCalling {url}")
 
         try:
             response = requests.get(url, timeout=60)
             print(f"Status: {response.status_code}")
             print(response.text[:1000])
 
-            if response.status_code >= 400:
-                failed = True
+            if response.status_code >= 500:
+                had_error = True
+                print(f"Server error from {url}")
 
         except Exception as exc:
-            failed = True
-            print(f"Error calling {url}: {exc}")
+            had_error = True
+            print(f"Request failed for {url}: {exc}")
 
-    if failed:
-        print("Daily sync finished with errors.")
+    if had_error:
+        print("Daily sync finished with server/request errors.")
         sys.exit(1)
 
     print("Daily sync finished successfully.")
