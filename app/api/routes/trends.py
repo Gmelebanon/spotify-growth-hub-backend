@@ -24,6 +24,18 @@ SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
     "it": {"name": "Italy", "spotify": "it", "youtube": "it"},
 }
 
+
+AGGREGATE_ALLOWED_COUNTRIES = {
+    "United States": "US",
+    "United Kingdom": "UK",
+    "Australia": "Australia",
+    "Germany": "Germany",
+    "France": "France",
+    "Brazil": "Brazil",
+    "Spain": "Spain",
+    "Italy": "Italy",
+}
+
 TIKTOK_COUNTRIES: dict[str, dict[str, str]] = {
     "worldwide": {"name": "Worldwide", "slug": "worldwide"},
     "global": {"name": "Worldwide", "slug": "worldwide"},
@@ -177,10 +189,34 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
             }
 
     if platform == "youtube":
+        if view == "global_daily":
+            return {
+                "title": "YouTube Global Daily",
+                "url": "https://kworb.net/youtube/realtime_anglo.html",
+            }
+
+        if view == "us_weekly":
+            return {
+                "title": "YouTube US Weekly",
+                "url": "https://kworb.net/youtube/insights/us.html",
+            }
+
+        if view == "global_trending_weekly":
+            return {
+                "title": "YouTube Global Trending Weekly",
+                "url": "https://kworb.net/youtube/insights/",
+            }
+
+        if view == "us_trending_daily":
+            return {
+                "title": "YouTube US Trending Daily",
+                "url": "https://kworb.net/youtube/trending/us.html",
+            }
+
         code = country_info["youtube"]
 
         if code == "global":
-            raise HTTPException(status_code=400, detail="YouTube global country chart is not supported.")
+            raise HTTPException(status_code=400, detail="Use global_daily or global_trending_weekly for YouTube global charts.")
 
         if view == "weekly_country":
             return {
@@ -192,18 +228,6 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
             return {
                 "title": f"YouTube Daily Chart - {country_info['name']}",
                 "url": f"https://kworb.net/youtube/insights/{code}_daily.html",
-            }
-
-        if view == "us_weekly":
-            return {
-                "title": "YouTube Weekly Chart - US",
-                "url": "https://kworb.net/youtube/insights/us.html",
-            }
-
-        if view == "us_daily":
-            return {
-                "title": "YouTube Daily Chart - US",
-                "url": "https://kworb.net/youtube/insights/us_daily.html",
             }
 
     if platform == "aggregate":
@@ -246,36 +270,79 @@ def spotify_record(cells: list[str]) -> dict[str, Any] | None:
 
 
 def youtube_record(cells: list[str]) -> dict[str, Any] | None:
-    if len(cells) < 5:
+    if len(cells) < 2:
         return None
 
     position = parse_int(cells[0])
     if position is None:
         return None
 
-    title_cell = cells[2] if len(cells) > 2 else cells[1]
-    artist, title = split_artist_title(title_cell)
-    if not title:
+    ignored = {
+        "pos",
+        "position",
+        "artist and title",
+        "video",
+        "title",
+        "views",
+        "streams",
+        "country",
+        "daily",
+        "weekly",
+    }
+
+    title_cell = ""
+    title_index = 1
+
+    for index, cell in enumerate(cells[1:], start=1):
+        cleaned = clean_text(cell)
+        if not cleaned:
+            continue
+
+        lowered = cleaned.lower()
+        if lowered in ignored:
+            continue
+
+        # Skip pure numeric metric cells.
+        if parse_int(cleaned) is not None and re.fullmatch(r"[\d,\\s+\\-]+", cleaned):
+            continue
+
+        # Skip simple movement cells.
+        if cleaned in {"=", "+", "-", "NEW", "RE"}:
+            continue
+
+        title_cell = cleaned
+        title_index = index
+        break
+
+    if not title_cell:
         return None
 
-    numeric_values = [parse_int(cell) for cell in cells]
-    numeric_present = [value for value in numeric_values if value is not None]
+    artist, title = split_artist_title(title_cell)
+    if not title:
+        title = title_cell
 
-    metric_value = numeric_present[-2] if len(numeric_present) >= 2 else (numeric_present[-1] if numeric_present else None)
-    metric_change = numeric_present[-1] if len(numeric_present) >= 2 else None
+    numeric_values = [parse_int(cell) for cell in cells]
+    numeric_present = [value for value in numeric_values[1:] if value is not None]
+
+    metric_value = numeric_present[-1] if numeric_present else None
+    metric_change = None
+
+    if len(numeric_present) >= 2:
+        metric_value = numeric_present[-2]
+        metric_change = numeric_present[-1]
 
     return {
         "position": position,
-        "position_change": clean_text(cells[1]) if len(cells) > 1 else "=",
+        "position_change": clean_text(cells[1]) if len(cells) > 1 and title_index != 1 else "=",
         "artist": artist,
         "title": title,
         "metric_label": "Views",
         "metric_value": metric_value,
         "metric_change": metric_change,
-        "extra_1_label": "Days/Weeks",
-        "extra_1_value": clean_text(cells[3]) if len(cells) > 3 else "",
-        "extra_2_label": "Peak",
-        "extra_2_value": clean_text(cells[4]) if len(cells) > 4 else "",
+        "extra_1_label": "Source",
+        "extra_1_value": "YouTube",
+        "extra_2_label": "Scope",
+        "extra_2_value": "Global/US",
         "total_label": "Total",
         "total_value": None,
         "raw": cells,
@@ -307,15 +374,19 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
     if country.lower() in ignored:
         return None
 
-    # Skip non-country header rows.
     if country.lower().startswith("current charts"):
         return None
+
+    if country not in AGGREGATE_ALLOWED_COUNTRIES:
+        return None
+
+    display_country = AGGREGATE_ALLOWED_COUNTRIES[country]
 
     return {
         "position": 0,
         "position_change": "",
         "artist": "",
-        "title": country,
+        "title": display_country,
         "metric_label": "Aggregate",
         "metric_value": None,
         "metric_change": None,
@@ -325,7 +396,7 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
         "extra_2_value": clean_text(cells[2]) if len(cells) > 2 else "",
         "total_label": "YouTube",
         "total_value": None,
-        "country": country,
+        "country": display_country,
         "itunes": clean_text(cells[1]) if len(cells) > 1 else "",
         "spotify": clean_text(cells[2]) if len(cells) > 2 else "",
         "apple_music": clean_text(cells[3]) if len(cells) > 3 else "",
