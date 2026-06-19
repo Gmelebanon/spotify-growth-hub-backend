@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 
 from app.core.database import Base, engine
 
@@ -28,6 +29,42 @@ load_dotenv()
 
 Base.metadata.create_all(bind=engine)
 
+ALLOWED_ORIGINS = {
+    "https://nerd-engine.vercel.app",
+    "https://nerd-engine-git-main-wissammantoufeh-5383s-projects.vercel.app",
+    "https://nerd-engine-96ldpmfe2-wissammantoufeh-5383s-projects.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+}
+
+
+def cors_origin(origin: str | None) -> str:
+    if not origin:
+        return "*"
+
+    if origin in ALLOWED_ORIGINS:
+        return origin
+
+    if origin.startswith("https://") and origin.endswith(".vercel.app"):
+        return origin
+
+    if origin.startswith("http://localhost:") or origin.startswith("http://127.0.0.1:"):
+        return origin
+
+    return "https://nerd-engine.vercel.app"
+
+
+def add_cors_headers(response: Response, origin: str | None) -> Response:
+    response.headers["Access-Control-Allow-Origin"] = cors_origin(origin)
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Vary"] = "Origin"
+    return response
+
+
 app = FastAPI(
     title="Spotify Growth Hub API",
     version="1.0.0",
@@ -35,20 +72,36 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://nerd-engine.vercel.app",
-        "https://nerd-engine-git-main-wissammantoufeh-5383s-projects.vercel.app",
-        "https://nerd-engine-96ldpmfe2-wissammantoufeh-5383s-projects.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ],
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def force_cors_on_all_responses(request: Request, call_next):
+    origin = request.headers.get("origin")
+
+    if request.method == "OPTIONS":
+        return add_cors_headers(Response(status_code=204), origin)
+
+    try:
+        response = await call_next(request)
+        return add_cors_headers(response, origin)
+    except Exception as exc:
+        # This prevents browser CORS masking when a route crashes.
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal server error",
+                "error": str(exc),
+                "path": request.url.path,
+            },
+        )
+        return add_cors_headers(response, origin)
+
 
 app.include_router(accounts.router)
 app.include_router(playlists.router)
@@ -74,3 +127,8 @@ app.include_router(trends.router)
 @app.get("/")
 def root():
     return {"ok": True, "service": "Spotify Growth Hub API"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
