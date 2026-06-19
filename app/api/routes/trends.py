@@ -116,6 +116,18 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
     view = view.lower().strip()
     country = (country or "us").lower().strip()
 
+    if platform == "tiktok":
+        if country not in TIKTOK_COUNTRIES:
+            raise HTTPException(status_code=400, detail="Unsupported TikTok country.")
+
+        tiktok_country = TIKTOK_COUNTRIES[country]
+        period = "7-days" if view in {"weekly_country", "us_weekly"} else "1-day"
+
+        return {
+            "title": f"TikTok Creations - {tiktok_country['name']} - {'Weekly' if period == '7-days' else 'Daily'}",
+            "url": f"https://chartex.com/tiktok/songs/{period}/{tiktok_country['slug']}?min_count=10000",
+        }
+
     if country not in SUPPORTED_COUNTRIES:
         raise HTTPException(status_code=400, detail="Unsupported country.")
 
@@ -152,8 +164,6 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
         code = country_info["youtube"]
 
         if code == "global":
-            # Kworb's YouTube Insights country pages are country-specific.
-            # Global is not used in the YouTube card list.
             raise HTTPException(status_code=400, detail="YouTube global country chart is not supported.")
 
         if view == "weekly_country":
@@ -179,18 +189,6 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
                 "title": "YouTube Daily Chart - US",
                 "url": "https://kworb.net/youtube/insights/us_daily.html",
             }
-
-    if platform == "tiktok":
-        if country not in TIKTOK_COUNTRIES:
-            raise HTTPException(status_code=400, detail="Unsupported TikTok country.")
-
-        tiktok_country = TIKTOK_COUNTRIES[country]
-        period = "7-days" if view in {"weekly_country", "us_weekly"} else "1-day"
-
-        return {
-            "title": f"TikTok Creations - {tiktok_country['name']} - {'Weekly' if period == '7-days' else 'Daily'}",
-            "url": f"https://chartex.com/tiktok/songs/{period}/{tiktok_country['slug']}?min_count=10000",
-        }
 
     if platform == "aggregate":
         return {
@@ -306,29 +304,80 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
     }
 
 
+TIKTOK_NAV_TITLES = {
+    "home",
+    "tiktok songs",
+    "all time",
+    "sounds",
+    "songs",
+    "artists",
+    "creators",
+    "others",
+    "pricing",
+    "login",
+    "filters",
+    "creates",
+    "streams",
+    "views",
+    "shazams",
+    "evolution:creates, streams",
+    "rank song title label / distributor metric descr.",
+    "rank song title record label metric descr.",
+}
+
+
+def is_bad_tiktok_title(value: str) -> bool:
+    title = clean_text(value).lower()
+
+    if not title:
+        return True
+
+    if title in TIKTOK_NAV_TITLES:
+        return True
+
+    if re.fullmatch(r"\d{1,2}\s+[a-z]{3}\s+\d{4}\s*-\s*\d{1,2}\s+[a-z]{3}\s+\d{4}", title):
+        return True
+
+    # Country/filter names appear as fake rows in Chartex's public HTML when the
+    # real chart data is not rendered server-side. Do not show them as songs.
+    country_names = {item["name"].lower() for item in TIKTOK_COUNTRIES.values()}
+    country_names.update({"united states", "united kingdom", "worldwide"})
+    if title in country_names:
+        return True
+
+    return False
+
+
 def tiktok_record(cells: list[str]) -> dict[str, Any] | None:
     if len(cells) < 3:
         return None
 
     position = parse_int(cells[0])
-    if position is None:
+    if position is None or position < 1 or position > 500:
         return None
 
-    # Chartex visible HTML generally exposes columns as:
-    # Rank / Song Title / Label or Distributor / Metric...
     title = clean_text(cells[1]) if len(cells) > 1 else ""
+    possible_artist = clean_text(cells[2]) if len(cells) > 2 else ""
+
+    if is_bad_tiktok_title(title):
+        return None
+
+    if title.lower().startswith("top tiktok songs"):
+        return None
+
     artist = ""
 
-    # Some Chartex rows expose "Song - Artist" or have an artist-like field after title.
-    possible_artist = clean_text(cells[2]) if len(cells) > 2 else ""
     if " - " in title:
         artist, title = split_artist_title(title)
-    elif possible_artist and parse_int(possible_artist) is None and possible_artist.lower() not in {
-        "creates", "streams", "views", "shazams", "metric descr.", "label / distributor", "record label"
-    }:
+    elif (
+        possible_artist
+        and parse_int(possible_artist) is None
+        and not is_bad_tiktok_title(possible_artist)
+        and possible_artist.lower() not in {"label / distributor", "record label", "metric descr."}
+    ):
         artist = possible_artist
 
-    if not title or title.lower() in {"song title", "rank", "metric descr."}:
+    if is_bad_tiktok_title(title):
         return None
 
     return {
@@ -372,7 +421,7 @@ def walk_json_for_tiktok_rows(value: Any, rows: list[dict[str, Any]]) -> None:
         )
         rank_value = lowered.get("rank") or lowered.get("position") or lowered.get("chartposition")
 
-        if title_value and rank_value is not None:
+        if title_value and rank_value is not None and not is_bad_tiktok_title(str(title_value)):
             position = parse_int(str(rank_value))
             if position is not None:
                 rows.append({
@@ -475,34 +524,42 @@ def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
-def fetch_chart(platform: str, view: str, country: str | None, limit: int) -> dict[str, Any]:
+
+def fetch_chart(platform: str, view: str, country: str | None, limit: int, refresh: bool) -> dict[str, Any]:
     source = build_source(platform, view, country)
+    source_url = source["url"]
 
-    response = requests.get(
-        source["url"],
-        timeout=30,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SpotifyGrowthHub/1.0; +https://nerd-engine.vercel.app)",
-            "Accept": "text/html,application/xhtml+xml",
-        },
-    )
-    response.raise_for_status()
+    # Important: cache must include platform AND final source URL.
+    # This prevents Spotify and YouTube cards with the same country/view from sharing data.
+    cache_key = f"{platform.lower()}::{view.lower()}::{(country or '').lower()}::{source_url}"
 
-    rows = parse_html(response.text, platform=platform, limit=limit)
-    if not rows:
-        raise ValueError("Could not find chart rows in Kworb response.")
+    now = datetime.utcnow()
+    cached = CACHE.get(cache_key)
 
-    return {
-        "platform": platform,
-        "view": view,
-        "country": country,
+    if cached and not refresh:
+        age = now - cached["fetched_at_dt"]
+        if age.total_seconds() < CACHE_TTL_SECONDS:
+            return cached["payload"]
+
+    html = fetch_html(source_url)
+    rows = parse_html(html, platform.lower(), limit)
+
+    payload = {
+        "platform": platform.lower(),
+        "view": view.lower(),
+        "country": (country or "").lower(),
         "title": source["title"],
-        "source_url": source["url"],
-        "chart_date": detect_chart_date(response.text),
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(rows),
+        "source_url": source_url,
+        "fetched_at": now.isoformat() + "Z",
         "rows": rows,
     }
+
+    CACHE[cache_key] = {
+        "fetched_at_dt": now,
+        "payload": payload,
+    }
+
+    return payload
 
 
 @router.get("/chart")
