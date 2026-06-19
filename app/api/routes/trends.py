@@ -13,8 +13,9 @@ router = APIRouter(prefix="/api/trends", tags=["Trends"])
 CACHE_TTL_SECONDS = 30 * 60
 
 SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
+    "global": {"name": "Global", "spotify": "global", "youtube": "global"},
     "us": {"name": "US", "spotify": "us", "youtube": "us"},
-    "gb": {"name": "UK", "spotify": "gb", "youtube": "gb"},
+    "gb": {"name": "UK", "spotify": "gb", "youtube": "uk"},
     "au": {"name": "Australia", "spotify": "au", "youtube": "au"},
     "de": {"name": "Germany", "spotify": "de", "youtube": "de"},
     "fr": {"name": "France", "spotify": "fr", "youtube": "fr"},
@@ -45,8 +46,7 @@ class KworbTableParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"td", "th"} and self.in_cell:
-            cell = clean_text(" ".join(self.current_cell))
-            self.current_row.append(cell)
+            self.current_row.append(clean_text(" ".join(self.current_cell)))
             self.current_cell = []
             self.in_cell = False
         elif tag == "tr" and self.in_row:
@@ -67,12 +67,15 @@ def clean_text(value: str) -> str:
 def parse_int(value: str | None) -> int | None:
     if value is None:
         return None
+
     cleaned = clean_text(value).replace(",", "")
     if cleaned in {"", "-", "="}:
         return None
+
     cleaned = re.sub(r"[^\d-]", "", cleaned)
     if cleaned in {"", "-"}:
         return None
+
     try:
         return int(cleaned)
     except ValueError:
@@ -83,6 +86,7 @@ def split_artist_title(value: str) -> tuple[str, str]:
     text = clean_text(value)
     if " - " not in text:
         return "", text
+
     artist, title = text.split(" - ", 1)
     return clean_text(artist), clean_text(title)
 
@@ -99,30 +103,32 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
     view = view.lower().strip()
     country = (country or "us").lower().strip()
 
-    if country == "global":
-        country_info = {"name": "Global", "spotify": "global", "youtube": "global"}
-    elif country in SUPPORTED_COUNTRIES:
-        country_info = SUPPORTED_COUNTRIES[country]
-    else:
+    if country not in SUPPORTED_COUNTRIES:
         raise HTTPException(status_code=400, detail="Unsupported country.")
 
+    country_info = SUPPORTED_COUNTRIES[country]
+
     if platform == "spotify":
-        spotify_country = country_info["spotify"]
-        if view == "weekly_country":
+        code = country_info["spotify"]
+
+        if view in {"weekly_country", "global_weekly"}:
             return {
                 "title": f"Spotify Weekly Chart - {country_info['name']}",
-                "url": f"https://kworb.net/spotify/country/{spotify_country}_weekly.html",
+                "url": f"https://kworb.net/spotify/country/{code}_weekly.html",
             }
-        if view == "daily_country":
+
+        if view in {"daily_country", "global_daily"}:
             return {
                 "title": f"Spotify Daily Chart - {country_info['name']}",
-                "url": f"https://kworb.net/spotify/country/{spotify_country}_daily.html",
+                "url": f"https://kworb.net/spotify/country/{code}_daily.html",
             }
+
         if view == "us_weekly":
             return {
                 "title": "Spotify Weekly Chart - US",
                 "url": "https://kworb.net/spotify/country/us_weekly.html",
             }
+
         if view == "us_daily":
             return {
                 "title": "Spotify Daily Chart - US",
@@ -130,22 +136,31 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
             }
 
     if platform == "youtube":
-        youtube_country = country_info["youtube"]
+        code = country_info["youtube"]
+
+        if code == "global":
+            # Kworb's YouTube Insights country pages are country-specific.
+            # Global is not used in the YouTube card list.
+            raise HTTPException(status_code=400, detail="YouTube global country chart is not supported.")
+
         if view == "weekly_country":
             return {
                 "title": f"YouTube Weekly Chart - {country_info['name']}",
-                "url": f"https://kworb.net/youtube/insights/{youtube_country}.html",
+                "url": f"https://kworb.net/youtube/insights/{code}.html",
             }
+
         if view == "daily_country":
             return {
                 "title": f"YouTube Daily Chart - {country_info['name']}",
-                "url": f"https://kworb.net/youtube/insights/{youtube_country}_daily.html",
+                "url": f"https://kworb.net/youtube/insights/{code}_daily.html",
             }
+
         if view == "us_weekly":
             return {
                 "title": "YouTube Weekly Chart - US",
                 "url": "https://kworb.net/youtube/insights/us.html",
             }
+
         if view == "us_daily":
             return {
                 "title": "YouTube Daily Chart - US",
@@ -153,8 +168,6 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
             }
 
     if platform == "aggregate":
-        # Aggregate is global only. Kworb's current charts page combines multiple platforms
-        # and countries as a global overview.
         return {
             "title": "Aggregate Global Current Charts",
             "url": "https://kworb.net/charts/index_a.html",
@@ -164,11 +177,14 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
 
 
 def spotify_record(cells: list[str]) -> dict[str, Any] | None:
-    # Pos / P+ / Artist and Title / Days|Wks / Pk / Streams / Streams+ / 7Day? / 7Day+? / Total?
+    # Kworb Spotify columns normally:
+    # Pos / P+ / Artist and Title / Days|Wks / Pk / Streams / Streams+ / Total...
     if len(cells) < 7:
         return None
+
     position = parse_int(cells[0])
     artist, title = split_artist_title(cells[2])
+
     if position is None or not title:
         return None
 
@@ -191,8 +207,6 @@ def spotify_record(cells: list[str]) -> dict[str, Any] | None:
 
 
 def youtube_record(cells: list[str]) -> dict[str, Any] | None:
-    # Kworb YouTube insights pages vary slightly, but usually include:
-    # Pos / P+ / Title / Days / Pk / Views / Views+
     if len(cells) < 5:
         return None
 
@@ -200,13 +214,11 @@ def youtube_record(cells: list[str]) -> dict[str, Any] | None:
     if position is None:
         return None
 
-    # Find the first meaningful text cell that is not a small number/movement.
-    title_index = 2 if len(cells) > 2 else 1
-    artist, title = split_artist_title(cells[title_index])
+    title_cell = cells[2] if len(cells) > 2 else cells[1]
+    artist, title = split_artist_title(title_cell)
     if not title:
         return None
 
-    # Last numeric cells are usually views/change.
     numeric_values = [parse_int(cell) for cell in cells]
     numeric_present = [value for value in numeric_values if value is not None]
 
@@ -232,8 +244,6 @@ def youtube_record(cells: list[str]) -> dict[str, Any] | None:
 
 
 def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
-    # Current Charts page does not have one fixed chart schema.
-    # Return a clean row from the available cells so the UI can still display it.
     if len(cells) < 2:
         return None
 
@@ -243,8 +253,9 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
 
     title_cell = ""
     for cell in cells[1:]:
-        if clean_text(cell) and parse_int(cell) is None and clean_text(cell) not in {"=", "NEW"}:
-            title_cell = clean_text(cell)
+        cleaned = clean_text(cell)
+        if cleaned and parse_int(cleaned) is None and cleaned not in {"=", "NEW"}:
+            title_cell = cleaned
             break
 
     if not title_cell:
@@ -274,19 +285,20 @@ def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
     parser = KworbTableParser()
     parser.feed(html)
 
-    records: list[dict[str, Any]] = []
     parser_fn = spotify_record
     if platform == "youtube":
         parser_fn = youtube_record
     elif platform == "aggregate":
         parser_fn = aggregate_record
 
+    rows: list[dict[str, Any]] = []
+
     for row in parser.rows:
         record = parser_fn(row)
         if record:
-            records.append(record)
+            rows.append(record)
 
-    return records[:limit]
+    return rows[:limit]
 
 
 def fetch_chart(platform: str, view: str, country: str | None, limit: int) -> dict[str, Any]:
@@ -324,7 +336,7 @@ def get_chart(
     platform: str = Query(default="spotify", pattern="^(spotify|youtube|aggregate)$"),
     view: str = Query(default="weekly_country"),
     country: str = Query(default="us"),
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     cache_key = f"{platform}:{view}:{country}:{limit}"
