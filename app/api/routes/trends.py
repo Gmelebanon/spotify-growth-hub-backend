@@ -24,6 +24,19 @@ SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
     "it": {"name": "Italy", "spotify": "it", "youtube": "it"},
 }
 
+TIKTOK_COUNTRIES: dict[str, dict[str, str]] = {
+    "worldwide": {"name": "Worldwide", "slug": "worldwide"},
+    "global": {"name": "Worldwide", "slug": "worldwide"},
+    "us": {"name": "US", "slug": "united-states"},
+    "gb": {"name": "UK", "slug": "united-kingdom"},
+    "au": {"name": "Australia", "slug": "australia"},
+    "de": {"name": "Germany", "slug": "germany"},
+    "fr": {"name": "France", "slug": "france"},
+    "br": {"name": "Brazil", "slug": "brazil"},
+    "es": {"name": "Spain", "slug": "spain"},
+    "it": {"name": "Italy", "slug": "italy"},
+}
+
 CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -167,6 +180,18 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
                 "url": "https://kworb.net/youtube/insights/us_daily.html",
             }
 
+    if platform == "tiktok":
+        if country not in TIKTOK_COUNTRIES:
+            raise HTTPException(status_code=400, detail="Unsupported TikTok country.")
+
+        tiktok_country = TIKTOK_COUNTRIES[country]
+        period = "7-days" if view in {"weekly_country", "us_weekly"} else "1-day"
+
+        return {
+            "title": f"TikTok Creations - {tiktok_country['name']} - {'Weekly' if period == '7-days' else 'Daily'}",
+            "url": f"https://chartex.com/tiktok/songs/{period}/{tiktok_country['slug']}?min_count=10000",
+        }
+
     if platform == "aggregate":
         return {
             "title": "Aggregate Global Current Charts",
@@ -281,7 +306,156 @@ def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
     }
 
 
+def tiktok_record(cells: list[str]) -> dict[str, Any] | None:
+    if len(cells) < 3:
+        return None
+
+    position = parse_int(cells[0])
+    if position is None:
+        return None
+
+    # Chartex visible HTML generally exposes columns as:
+    # Rank / Song Title / Label or Distributor / Metric...
+    title = clean_text(cells[1]) if len(cells) > 1 else ""
+    artist = ""
+
+    # Some Chartex rows expose "Song - Artist" or have an artist-like field after title.
+    possible_artist = clean_text(cells[2]) if len(cells) > 2 else ""
+    if " - " in title:
+        artist, title = split_artist_title(title)
+    elif possible_artist and parse_int(possible_artist) is None and possible_artist.lower() not in {
+        "creates", "streams", "views", "shazams", "metric descr.", "label / distributor", "record label"
+    }:
+        artist = possible_artist
+
+    if not title or title.lower() in {"song title", "rank", "metric descr."}:
+        return None
+
+    return {
+        "position": position,
+        "position_change": "=",
+        "artist": artist,
+        "title": title,
+        "metric_label": "Creates",
+        "metric_value": None,
+        "metric_change": None,
+        "extra_1_label": "Source",
+        "extra_1_value": "Chartex",
+        "extra_2_label": "Platform",
+        "extra_2_value": "TikTok",
+        "total_label": "Total",
+        "total_value": None,
+        "raw": cells,
+    }
+
+
+def walk_json_for_tiktok_rows(value: Any, rows: list[dict[str, Any]]) -> None:
+    if len(rows) >= 500:
+        return
+
+    if isinstance(value, dict):
+        lowered = {str(k).lower(): v for k, v in value.items()}
+
+        title_value = (
+            lowered.get("title")
+            or lowered.get("songtitle")
+            or lowered.get("song_title")
+            or lowered.get("name")
+            or lowered.get("tracktitle")
+        )
+        artist_value = (
+            lowered.get("artist")
+            or lowered.get("artistname")
+            or lowered.get("artist_name")
+            or lowered.get("author")
+            or lowered.get("creator")
+        )
+        rank_value = lowered.get("rank") or lowered.get("position") or lowered.get("chartposition")
+
+        if title_value and rank_value is not None:
+            position = parse_int(str(rank_value))
+            if position is not None:
+                rows.append({
+                    "position": position,
+                    "position_change": "=",
+                    "artist": clean_text(str(artist_value or "")),
+                    "title": clean_text(str(title_value)),
+                    "metric_label": "Creates",
+                    "metric_value": None,
+                    "metric_change": None,
+                    "extra_1_label": "Source",
+                    "extra_1_value": "Chartex",
+                    "extra_2_label": "Platform",
+                    "extra_2_value": "TikTok",
+                    "total_label": "Total",
+                    "total_value": None,
+                    "raw": [],
+                })
+
+        for child in value.values():
+            walk_json_for_tiktok_rows(child, rows)
+
+    elif isinstance(value, list):
+        for child in value:
+            walk_json_for_tiktok_rows(child, rows)
+
+
+def parse_tiktok_html(html: str, limit: int) -> list[dict[str, Any]]:
+    parser = KworbTableParser()
+    parser.feed(html)
+
+    rows: list[dict[str, Any]] = []
+    for row in parser.rows:
+        record = tiktok_record(row)
+        if record:
+            rows.append(record)
+
+    if rows:
+        return rows[:limit]
+
+    # Fallback: attempt to find embedded JSON used by modern app pages.
+    import json
+
+    json_candidates = re.findall(r'<script[^>]*>(.*?)</script>', html, flags=re.DOTALL | re.IGNORECASE)
+    json_rows: list[dict[str, Any]] = []
+
+    for candidate in json_candidates:
+        candidate = candidate.strip()
+        if not candidate or ("song" not in candidate.lower() and "title" not in candidate.lower()):
+            continue
+
+        # Plain JSON script.
+        if candidate.startswith("{") or candidate.startswith("["):
+            try:
+                data = json.loads(candidate)
+                walk_json_for_tiktok_rows(data, json_rows)
+            except Exception:
+                pass
+
+        # Next app/router serialized chunks may contain escaped JSON. Try broad object snippets.
+        for match in re.finditer(r'(\{[^{}]{0,5000}"(?:title|songTitle|name|rank|position)"[^{}]{0,5000}\})', candidate):
+            try:
+                data = json.loads(match.group(1))
+                walk_json_for_tiktok_rows(data, json_rows)
+            except Exception:
+                continue
+
+    seen: set[tuple[int, str, str]] = set()
+    unique_rows: list[dict[str, Any]] = []
+    for row in json_rows:
+        key = (int(row.get("position") or 0), str(row.get("title") or ""), str(row.get("artist") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+
+    return sorted(unique_rows, key=lambda item: int(item.get("position") or 999999))[:limit]
+
+
 def parse_html(html: str, platform: str, limit: int) -> list[dict[str, Any]]:
+    if platform == "tiktok":
+        return parse_tiktok_html(html, limit)
+
     parser = KworbTableParser()
     parser.feed(html)
 
@@ -333,7 +507,7 @@ def fetch_chart(platform: str, view: str, country: str | None, limit: int) -> di
 
 @router.get("/chart")
 def get_chart(
-    platform: str = Query(default="spotify", pattern="^(spotify|youtube|aggregate)$"),
+    platform: str = Query(default="spotify", pattern="^(spotify|youtube|aggregate|tiktok)$"),
     view: str = Query(default="weekly_country"),
     country: str = Query(default="us"),
     limit: int = Query(default=100, ge=1, le=500),
