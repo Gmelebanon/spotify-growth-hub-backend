@@ -192,8 +192,8 @@ def build_source(platform: str, view: str, country: str | None) -> dict[str, str
 
     if platform == "aggregate":
         return {
-            "title": "Aggregate Global Current Charts",
-            "url": "https://kworb.net/charts/index_a.html",
+            "title": "Aggregate Current Charts",
+            "url": "https://kworb.net/charts/",
         }
 
     raise HTTPException(status_code=400, detail="Unsupported trends source.")
@@ -267,39 +267,55 @@ def youtube_record(cells: list[str]) -> dict[str, Any] | None:
 
 
 def aggregate_record(cells: list[str]) -> dict[str, Any] | None:
-    if len(cells) < 2:
+    # Kworb /charts/ rows:
+    # Country / iTunes / Spotify / Apple Music / YouTube / Shazam / Deezer
+    if len(cells) < 7:
         return None
 
-    position = parse_int(cells[0])
-    if position is None:
+    country = clean_text(cells[0])
+    if not country:
         return None
 
-    title_cell = ""
-    for cell in cells[1:]:
-        cleaned = clean_text(cell)
-        if cleaned and parse_int(cleaned) is None and cleaned not in {"=", "NEW"}:
-            title_cell = cleaned
-            break
+    ignored = {
+        "country",
+        "main countries:",
+        "other countries:",
+        "itunes",
+        "spotify",
+        "apple music",
+        "youtube",
+        "shazam",
+        "deezer",
+    }
 
-    if not title_cell:
+    if country.lower() in ignored:
         return None
 
-    artist, title = split_artist_title(title_cell)
+    # Skip non-country header rows.
+    if country.lower().startswith("current charts"):
+        return None
 
     return {
-        "position": position,
-        "position_change": clean_text(cells[1]) if len(cells) > 1 else "=",
-        "artist": artist,
-        "title": title,
-        "metric_label": "Score",
-        "metric_value": parse_int(cells[-1]),
+        "position": 0,
+        "position_change": "",
+        "artist": "",
+        "title": country,
+        "metric_label": "Aggregate",
+        "metric_value": None,
         "metric_change": None,
-        "extra_1_label": "Platform",
-        "extra_1_value": "All",
-        "extra_2_label": "Scope",
-        "extra_2_value": "Global",
-        "total_label": "Raw",
+        "extra_1_label": "iTunes",
+        "extra_1_value": clean_text(cells[1]) if len(cells) > 1 else "",
+        "extra_2_label": "Spotify",
+        "extra_2_value": clean_text(cells[2]) if len(cells) > 2 else "",
+        "total_label": "YouTube",
         "total_value": None,
+        "country": country,
+        "itunes": clean_text(cells[1]) if len(cells) > 1 else "",
+        "spotify": clean_text(cells[2]) if len(cells) > 2 else "",
+        "apple_music": clean_text(cells[3]) if len(cells) > 3 else "",
+        "youtube": clean_text(cells[4]) if len(cells) > 4 else "",
+        "shazam": clean_text(cells[5]) if len(cells) > 5 else "",
+        "deezer": clean_text(cells[6]) if len(cells) > 6 else "",
         "raw": cells,
     }
 
