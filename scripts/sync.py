@@ -14,17 +14,28 @@ BACKEND_BASE_URL = (
     or DEFAULT_BACKEND_BASE_URL
 ).strip().rstrip("/")
 
-ENDPOINTS = [
+TIMEOUT_SECONDS = int(os.getenv("SYNC_TIMEOUT_SECONDS", "90"))
+
+# These endpoints are for warming/checking normal app pages.
+CHECK_ENDPOINTS = [
     "/",
     "/api/accounts",
     "/api/playlists",
     "/api/scheduling",
     "/api/song-metrics",
     "/api/artist-library",
-    "/api/trends/tiktok/sync?country=all",
 ]
 
-TIMEOUT_SECONDS = int(os.getenv("SYNC_TIMEOUT_SECONDS", "60"))
+# These endpoints are the actual refresh triggers.
+# They force the backend to fetch fresh remote data where supported.
+REFRESH_ENDPOINTS = [
+    "/api/playlists?refresh=true",
+    "/api/song-metrics?refresh=true",
+    "/api/artist-library?refresh=true",
+    "/api/trends/chart?platform=spotify&view=weekly_country&country=global&limit=100&refresh=true",
+    "/api/trends/chart?platform=youtube&view=global_trending_weekly&country=global&limit=100&refresh=true",
+    "/api/trends/tiktok/sync?country=all&force=true",
+]
 
 
 def absolute_url(path: str) -> str:
@@ -40,7 +51,7 @@ def absolute_url(path: str) -> str:
     return f"{BACKEND_BASE_URL}/{path.lstrip('/')}"
 
 
-def call_endpoint(path: str) -> bool:
+def call_endpoint(path: str, required: bool = True) -> bool:
     url = absolute_url(path)
     print(f"\n→ Calling {url}")
 
@@ -49,12 +60,27 @@ def call_endpoint(path: str) -> bool:
         print(f"  Status: {response.status_code}")
 
         if response.status_code >= 500:
-            print(f"  Server error: {response.text[:500]}")
+            print(f"  Server error: {response.text[:800]}")
             return False
 
         if response.status_code >= 400:
-            print(f"  Warning: endpoint returned {response.status_code}: {response.text[:500]}")
-            return True
+            message = f"  Warning: endpoint returned {response.status_code}: {response.text[:800]}"
+            print(message)
+            return not required
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            if "rows" in payload and isinstance(payload["rows"], list):
+                print(f"  Rows: {len(payload['rows'])}")
+            if "synced" in payload and isinstance(payload["synced"], list):
+                print(f"  Synced items: {len(payload['synced'])}")
+                print(f"  Request count: {payload.get('request_count', 'n/a')}")
+            if "last_sync" in payload:
+                print(f"  Last sync: {payload.get('last_sync')}")
 
         return True
 
@@ -75,7 +101,7 @@ def mark_sync_status(success: bool) -> None:
         response = requests.post(url, json=payload, timeout=TIMEOUT_SECONDS)
         print(f"\n→ Mark sync status: {response.status_code}")
         if response.status_code >= 400:
-            print(f"  Warning: could not mark sync status: {response.text[:500]}")
+            print(f"  Warning: could not mark sync status: {response.text[:800]}")
     except requests.RequestException as exc:
         print(f"\n→ Warning: could not mark sync status: {exc}")
 
@@ -86,8 +112,14 @@ def main() -> int:
 
     success = True
 
-    for endpoint in ENDPOINTS:
-        if not call_endpoint(endpoint):
+    print("\n=== Refresh endpoints ===")
+    for endpoint in REFRESH_ENDPOINTS:
+        if not call_endpoint(endpoint, required=True):
+            success = False
+
+    print("\n=== Check endpoints ===")
+    for endpoint in CHECK_ENDPOINTS:
+        if not call_endpoint(endpoint, required=False):
             success = False
 
     mark_sync_status(success)
@@ -98,7 +130,7 @@ def main() -> int:
         print("Result: success")
         return 0
 
-    print("Result: failed because at least one endpoint had a request/server error.")
+    print("Result: failed because at least one required refresh endpoint had a request/server error.")
     return 1
 
 
