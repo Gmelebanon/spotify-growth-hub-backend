@@ -663,30 +663,46 @@ def parse_chartex_tiktok_table(html: str, limit: int) -> list[dict[str, Any]]:
 
     for row in parser.rows:
         flat = [first_non_empty(cell) for cell in row]
-        if len(flat) < 3:
+
+        # Real Chartex TikTok rows have many columns:
+        # Rank | Sound name on TikTok | Song Title | Label / Distributor
+        # | Growth | Creates 24h | Creates 7 Days | Creates Total | Evolution
+        if len(flat) < 7:
             continue
 
         position = parse_int(flat[0])
         if position is None or position < 1 or position > 500:
             continue
 
-        # Header row guard.
         joined = " ".join(flat).lower()
-        if "sound name on tiktok" in joined or "song title" in joined:
+
+        # Header/filter/date/navigation rows can look like rank rows after HTML flattening.
+        # These were causing Global Daily / US Daily to show "Last 24 Hours" only.
+        blocked_phrases = {
+            "sound name on tiktok",
+            "song title",
+            "last 24 hours",
+            "last 7 days",
+            "top tiktok sounds",
+            "united states",
+            "worldwide",
+            "filter",
+            "search for a sound",
+        }
+
+        if any(phrase in joined for phrase in blocked_phrases):
             continue
 
-        # Chartex visible columns:
-        # Rank | Sound name on TikTok | Song Title | Label / Distributor | ...
+        # Use ONLY the Chartex Song Title column. Do not fall back to the sound-name
+        # column because it can produce incorrect rows like "original sound..." or
+        # page-control labels.
         song_parts = row[2] if len(row) > 2 else []
-        sound_parts = row[1] if len(row) > 1 else []
-
         title, artist = chartex_song_title_artist_from_parts(song_parts)
 
-        # If Chartex has no matched song title, fall back to the sound name.
-        if not title:
-            title, artist = chartex_song_title_artist_from_parts(sound_parts)
-
         if not title or is_bad_tiktok_title(title):
+            continue
+
+        if title.lower() in {"last 24 hours", "last 7 days", "all countries", "united states", "worldwide"}:
             continue
 
         rows.append({
@@ -736,7 +752,7 @@ def tiktok_record(cells: list[str]) -> dict[str, Any] | None:
         title = fallback_source
         artist = ""
 
-    if is_bad_tiktok_title(title):
+    if is_bad_tiktok_title(title) or title.lower() in {"last 24 hours", "last 7 days", "united states", "worldwide"}:
         return None
 
     return {
