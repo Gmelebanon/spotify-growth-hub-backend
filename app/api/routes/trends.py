@@ -811,6 +811,8 @@ def chartex_song_params(country_code: str) -> dict[str, Any]:
 
     if country_code:
         params["country_codes"] = country_code
+        params["country_code"] = country_code
+        params["country"] = country_code
 
     if CHARTEX_MIN_VALUE > 0:
         params["min_tiktok_sounds_count"] = CHARTEX_MIN_VALUE
@@ -828,6 +830,8 @@ def chartex_sound_params(view: str, country_code: str) -> dict[str, Any]:
 
     if country_code:
         params["country_codes"] = country_code
+        params["country_code"] = country_code
+        params["country"] = country_code
 
     if CHARTEX_MIN_VALUE > 0:
         params["min_value"] = CHARTEX_MIN_VALUE
@@ -1140,10 +1144,12 @@ def sync_tiktok_chart(
 
     attempts: list[dict[str, Any]] = []
 
-    # Try the Songs Chart first because it is the chart-level endpoint for songs.
+    # Use the TikTok Sounds endpoint first because it supports daily/weekly sorting.
+    # The Songs endpoint is only a fallback because it can return the same global order
+    # across multiple TikTok cards.
     request_plan = [
-        ("songs", chartex_songs_url(), chartex_song_params(country_code)),
         ("sounds", chartex_sounds_url(), chartex_sound_params(normalized_view, country_code)),
+        ("songs", chartex_songs_url(), chartex_song_params(country_code)),
     ]
 
     rows: list[dict[str, Any]] = []
