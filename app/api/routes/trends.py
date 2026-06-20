@@ -792,6 +792,43 @@ def chartex_sounds_url() -> str:
     return f"{CHARTEX_API_BASE_URL.rstrip('/')}/external/v1/tiktok-sounds/"
 
 
+
+
+def chartex_web_period_for_view(view: str) -> str:
+    normalized_view = normalize_tiktok_view(view)
+    return "24-hours" if normalized_view == "daily_country" else "7-days"
+
+
+def chartex_web_country_slug(country: str) -> str:
+    normalized_country = country.lower().strip()
+
+    if normalized_country in {"global", "worldwide"}:
+        return "worldwide"
+
+    country_info = TIKTOK_COUNTRIES.get(normalized_country)
+
+    if country_info:
+        return country_info.get("slug", normalized_country)
+
+    return normalized_country
+
+
+def chartex_tiktok_web_url(view: str, country: str) -> str:
+    return (
+        "https://chartex.com/tiktok/songs/"
+        f"{chartex_web_period_for_view(view)}/"
+        f"{chartex_web_country_slug(country)}"
+    )
+
+
+def chartex_spotify_web_url(view: str, country: str) -> str:
+    country_slug = "worldwide" if country.lower().strip() in {"global", "worldwide"} else country.lower().strip()
+    return (
+        "https://chartex.com/spotify/songs/"
+        f"{chartex_web_period_for_view(view)}/"
+        f"{country_slug}"
+    )
+
 def chartex_sort_by_for_view(view: str) -> str:
     normalized_view = normalize_tiktok_view(view)
     if normalized_view == "daily_country":
@@ -1144,12 +1181,15 @@ def sync_tiktok_chart(
 
     attempts: list[dict[str, Any]] = []
 
-    # Use the TikTok Sounds endpoint first because it supports daily/weekly sorting.
-    # The Songs endpoint is only a fallback because it can return the same global order
-    # across multiple TikTok cards.
+    # Try the exact Chartex web chart URL first:
+    # https://chartex.com/tiktok/songs/24-hours/united-states
+    # https://chartex.com/tiktok/songs/7-days/united-states
+    # and the matching worldwide versions.
+    # API endpoints are fallbacks.
     request_plan = [
-        ("sounds", chartex_sounds_url(), chartex_sound_params(normalized_view, country_code)),
-        ("songs", chartex_songs_url(), chartex_song_params(country_code)),
+        ("web", chartex_tiktok_web_url(normalized_view, normalized_country), {}, "html"),
+        ("sounds", chartex_sounds_url(), chartex_sound_params(normalized_view, country_code), "json"),
+        ("songs", chartex_songs_url(), chartex_song_params(country_code), "json"),
     ]
 
     rows: list[dict[str, Any]] = []
@@ -1158,22 +1198,34 @@ def sync_tiktok_chart(
     selected_url = ""
     selected_params: dict[str, Any] = {}
 
-    for source_name, url, params in request_plan:
+    for source_name, url, params, response_type in request_plan:
         response = requests.get(url, headers=chartex_headers(), params=params, timeout=30)
         response.raise_for_status()
 
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail="Chartex API did not return JSON.") from exc
+        if response_type == "html":
+            payload = response.text
+            extracted_rows = parse_tiktok_html(payload, 100)
+            debug = {
+                "payload_type": "html",
+                "html_length": len(payload),
+                "source_url": url,
+            }
+        else:
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail="Chartex API did not return JSON.") from exc
 
-        extracted_rows = extract_chartex_rows(payload)
+            extracted_rows = extract_chartex_rows(payload)
+            debug = payload_debug_summary(payload)
+
         attempts.append({
             "source": source_name,
             "url": url,
             "params": params,
+            "response_type": response_type,
             "rows_found": len(extracted_rows),
-            "debug": payload_debug_summary(payload),
+            "debug": debug,
         })
 
         if extracted_rows:
