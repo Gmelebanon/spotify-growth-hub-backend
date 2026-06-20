@@ -592,6 +592,123 @@ def is_bad_tiktok_title(value: str) -> bool:
     return False
 
 
+
+class ChartexTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_row = False
+        self.in_cell = False
+        self.current_cell: list[str] = []
+        self.current_row: list[list[str]] = []
+        self.rows: list[list[list[str]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self.in_row = True
+            self.current_row = []
+        elif self.in_row and tag in {"td", "th"}:
+            self.in_cell = True
+            self.current_cell = []
+        elif self.in_cell and tag in {"br", "p", "div"}:
+            self.current_cell.append("\\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"a", "span", "p", "div"} and self.in_cell:
+            self.current_cell.append("\\n")
+        elif tag in {"td", "th"} and self.in_cell:
+            parts = [clean_text(part) for part in " ".join(self.current_cell).split("\\n")]
+            self.current_row.append([part for part in parts if part])
+            self.current_cell = []
+            self.in_cell = False
+        elif tag == "tr" and self.in_row:
+            if self.current_row:
+                self.rows.append(self.current_row)
+            self.current_row = []
+            self.in_row = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.current_cell.append(data)
+
+
+def first_non_empty(parts: list[str]) -> str:
+    for part in parts:
+        cleaned = clean_text(part)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def chartex_song_title_artist_from_parts(parts: list[str]) -> tuple[str, str]:
+    cleaned = [clean_text(part) for part in parts if clean_text(part)]
+
+    if not cleaned:
+        return "", ""
+
+    # Chartex song cells usually render title first and artist second.
+    title = cleaned[0]
+    artist = cleaned[1] if len(cleaned) > 1 else ""
+
+    if " - " in title and not artist:
+        artist, title = split_artist_title(title)
+
+    return title, artist
+
+
+def parse_chartex_tiktok_table(html: str, limit: int) -> list[dict[str, Any]]:
+    parser = ChartexTableParser()
+    parser.feed(html)
+
+    rows: list[dict[str, Any]] = []
+
+    for row in parser.rows:
+        flat = [first_non_empty(cell) for cell in row]
+        if len(flat) < 3:
+            continue
+
+        position = parse_int(flat[0])
+        if position is None or position < 1 or position > 500:
+            continue
+
+        # Header row guard.
+        joined = " ".join(flat).lower()
+        if "sound name on tiktok" in joined or "song title" in joined:
+            continue
+
+        # Chartex visible columns:
+        # Rank | Sound name on TikTok | Song Title | Label / Distributor | ...
+        song_parts = row[2] if len(row) > 2 else []
+        sound_parts = row[1] if len(row) > 1 else []
+
+        title, artist = chartex_song_title_artist_from_parts(song_parts)
+
+        # If Chartex has no matched song title, fall back to the sound name.
+        if not title:
+            title, artist = chartex_song_title_artist_from_parts(sound_parts)
+
+        if not title or is_bad_tiktok_title(title):
+            continue
+
+        rows.append({
+            "position": position,
+            "position_change": "=",
+            "artist": artist,
+            "title": title,
+            "metric_label": "Creates",
+            "metric_value": parse_int(flat[6] if len(flat) > 6 else None),
+            "metric_change": None,
+            "extra_1_label": "Source",
+            "extra_1_value": "Chartex",
+            "extra_2_label": "Platform",
+            "extra_2_value": "TikTok",
+            "total_label": "Total",
+            "total_value": parse_int(flat[7] if len(flat) > 7 else None),
+            "raw": flat,
+        })
+
+    return rows[:limit]
+
+
 def tiktok_record(cells: list[str]) -> dict[str, Any] | None:
     if len(cells) < 3:
         return None
@@ -600,26 +717,24 @@ def tiktok_record(cells: list[str]) -> dict[str, Any] | None:
     if position is None or position < 1 or position > 500:
         return None
 
-    title = clean_text(cells[1]) if len(cells) > 1 else ""
-    possible_artist = clean_text(cells[2]) if len(cells) > 2 else ""
-
-    if is_bad_tiktok_title(title):
+    joined = " ".join(cells).lower()
+    if "sound name on tiktok" in joined or "song title" in joined:
         return None
 
-    if title.lower().startswith("top tiktok songs"):
-        return None
+    # Chartex table format:
+    # Rank | Sound name on TikTok | Song Title | Label / Distributor | ...
+    title_source = clean_text(cells[2]) if len(cells) > 2 else clean_text(cells[1])
+    fallback_source = clean_text(cells[1]) if len(cells) > 1 else ""
 
+    title = title_source
     artist = ""
 
     if " - " in title:
         artist, title = split_artist_title(title)
-    elif (
-        possible_artist
-        and parse_int(possible_artist) is None
-        and not is_bad_tiktok_title(possible_artist)
-        and possible_artist.lower() not in {"label / distributor", "record label", "metric descr."}
-    ):
-        artist = possible_artist
+
+    if is_bad_tiktok_title(title):
+        title = fallback_source
+        artist = ""
 
     if is_bad_tiktok_title(title):
         return None
@@ -694,6 +809,15 @@ def walk_json_for_tiktok_rows(value: Any, rows: list[dict[str, Any]]) -> None:
 
 
 def parse_tiktok_html(html: str, limit: int) -> list[dict[str, Any]]:
+    # First parse the visible Chartex table. This is the trusted source for:
+    # /tiktok/songs/24-hours/worldwide
+    # /tiktok/songs/7-days/worldwide
+    # /tiktok/songs/24-hours/united-states
+    # /tiktok/songs/7-days/united-states
+    chartex_rows = parse_chartex_tiktok_table(html, limit)
+    if chartex_rows:
+        return chartex_rows[:limit]
+
     parser = KworbTableParser()
     parser.feed(html)
 
@@ -1181,15 +1305,10 @@ def sync_tiktok_chart(
 
     attempts: list[dict[str, Any]] = []
 
-    # Try the exact Chartex web chart URL first:
-    # https://chartex.com/tiktok/songs/24-hours/united-states
-    # https://chartex.com/tiktok/songs/7-days/united-states
-    # and the matching worldwide versions.
-    # API endpoints are fallbacks.
+    # Use the exact Chartex web chart URL only, so cards do not fall back to
+    # the same generic API order.
     request_plan = [
         ("web", chartex_tiktok_web_url(normalized_view, normalized_country), {}, "html"),
-        ("sounds", chartex_sounds_url(), chartex_sound_params(normalized_view, country_code), "json"),
-        ("songs", chartex_songs_url(), chartex_song_params(country_code), "json"),
     ]
 
     rows: list[dict[str, Any]] = []
@@ -1242,9 +1361,19 @@ def sync_tiktok_chart(
         selected_url = url
         selected_params = params
 
+    if not rows:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Could not extract TikTok rows from the Chartex web chart.",
+                "source_url": chartex_tiktok_web_url(normalized_view, normalized_country),
+                "attempts": attempts,
+            },
+        )
+
     now = datetime.utcnow()
 
-    # Replace the chart snapshot atomically enough for this small table.
+    # Replace the chart snapshot only after valid rows were extracted.
     (
         db.query(TikTokTrendRow)
         .filter(TikTokTrendRow.country == normalized_country)
