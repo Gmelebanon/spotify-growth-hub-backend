@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 from typing import Any
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Session
 
@@ -44,6 +44,20 @@ class TikTokTrendRow(Base):
         UniqueConstraint("country", "view", "position", name="uq_tiktok_trends_country_view_position"),
     )
 
+
+
+
+
+class SocialTrendTodoItem(Base):
+    __tablename__ = "social_trend_todo_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    platform = Column(String(40), nullable=False, index=True)
+    card_title = Column(String(120), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    title = Column(Text, nullable=False)
+    artist = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 SUPPORTED_COUNTRIES: dict[str, dict[str, str]] = {
@@ -1277,6 +1291,88 @@ def fetch_chart(platform: str, view: str, country: str | None, limit: int, refre
     }
 
     return payload
+
+
+
+
+def serialize_social_trend_todo_item(item: SocialTrendTodoItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "platform": item.platform,
+        "card_title": item.card_title,
+        "position": item.position,
+        "title": item.title,
+        "artist": item.artist,
+        "created_at": item.created_at.isoformat() + "Z" if item.created_at else "",
+    }
+
+
+@router.get("/todo")
+def get_social_trends_todo(db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = (
+        db.query(SocialTrendTodoItem)
+        .order_by(SocialTrendTodoItem.created_at.desc(), SocialTrendTodoItem.id.desc())
+        .all()
+    )
+
+    return {"items": [serialize_social_trend_todo_item(row) for row in rows]}
+
+
+@router.post("/todo")
+def add_social_trends_todo(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    raw_items = payload.get("items", [])
+
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=400, detail="items must be a list")
+
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+
+        title = str(raw_item.get("title") or "").strip()
+        artist = str(raw_item.get("artist") or "").strip()
+
+        if not title:
+            continue
+
+        existing = (
+            db.query(SocialTrendTodoItem)
+            .filter(SocialTrendTodoItem.title == title)
+            .filter(SocialTrendTodoItem.artist == artist)
+            .first()
+        )
+
+        if existing:
+            continue
+
+        row = SocialTrendTodoItem(
+            platform=str(raw_item.get("platform") or "").strip()[:40],
+            card_title=str(raw_item.get("cardTitle") or raw_item.get("card_title") or "").strip()[:120],
+            position=int(raw_item.get("position") or 0),
+            title=title,
+            artist=artist or "-",
+        )
+        db.add(row)
+
+    db.commit()
+
+    return get_social_trends_todo(db)
+
+
+@router.delete("/todo/{item_id}")
+def delete_social_trends_todo(item_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.query(SocialTrendTodoItem).filter(SocialTrendTodoItem.id == item_id).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Todo item not found")
+
+    db.delete(row)
+    db.commit()
+
+    return {"ok": True, "deleted_id": item_id}
 
 
 @router.get("/chart")
