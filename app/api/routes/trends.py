@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Session
 
 from app.core.database import Base, get_db
@@ -57,6 +57,8 @@ class SocialTrendTodoItem(Base):
     position = Column(Integer, nullable=False, default=0)
     title = Column(Text, nullable=False)
     artist = Column(Text, nullable=False)
+    is_done = Column(Boolean, nullable=False, default=False)
+    done_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -1295,6 +1297,30 @@ def fetch_chart(platform: str, view: str, country: str | None, limit: int, refre
 
 
 
+
+def ensure_social_trend_todo_schema(db: Session) -> None:
+    bind = db.get_bind()
+    dialect = bind.dialect.name
+
+    if dialect == "postgresql":
+        db.execute("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS is_done BOOLEAN NOT NULL DEFAULT FALSE")
+        db.execute("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS done_at TIMESTAMP")
+        db.commit()
+        return
+
+    try:
+        db.execute("ALTER TABLE social_trend_todo_items ADD COLUMN is_done BOOLEAN NOT NULL DEFAULT 0")
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
+        db.execute("ALTER TABLE social_trend_todo_items ADD COLUMN done_at TIMESTAMP")
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def serialize_social_trend_todo_item(item: SocialTrendTodoItem) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -1303,15 +1329,27 @@ def serialize_social_trend_todo_item(item: SocialTrendTodoItem) -> dict[str, Any
         "position": item.position,
         "title": item.title,
         "artist": item.artist,
+        "is_done": bool(getattr(item, "is_done", False)),
+        "done_at": item.done_at.isoformat() + "Z" if getattr(item, "done_at", None) else "",
         "created_at": item.created_at.isoformat() + "Z" if item.created_at else "",
     }
 
 
 @router.get("/todo")
-def get_social_trends_todo(db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_social_trends_todo(
+    include_done: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
+
+    query = db.query(SocialTrendTodoItem)
+
+    if not include_done:
+        query = query.filter(SocialTrendTodoItem.is_done == False)  # noqa: E712
+
     rows = (
-        db.query(SocialTrendTodoItem)
-        .order_by(SocialTrendTodoItem.created_at.desc(), SocialTrendTodoItem.id.desc())
+        query
+        .order_by(SocialTrendTodoItem.is_done.asc(), SocialTrendTodoItem.created_at.desc(), SocialTrendTodoItem.id.desc())
         .all()
     )
 
@@ -1323,6 +1361,7 @@ def add_social_trends_todo(
     payload: dict[str, Any] = Body(default_factory=dict),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
     raw_items = payload.get("items", [])
 
     if not isinstance(raw_items, list):
@@ -1342,6 +1381,7 @@ def add_social_trends_todo(
             db.query(SocialTrendTodoItem)
             .filter(SocialTrendTodoItem.title == title)
             .filter(SocialTrendTodoItem.artist == artist)
+            .filter(SocialTrendTodoItem.is_done == False)  # noqa: E712
             .first()
         )
 
@@ -1359,11 +1399,82 @@ def add_social_trends_todo(
 
     db.commit()
 
-    return get_social_trends_todo(db)
+    return get_social_trends_todo(include_done=False, db=db)
+
+
+
+@router.post("/todo/{item_id}/done")
+def mark_social_trends_todo_done(item_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
+
+    row = db.query(SocialTrendTodoItem).filter(SocialTrendTodoItem.id == item_id).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Todo item not found")
+
+    row.is_done = True
+    row.done_at = datetime.utcnow()
+    db.commit()
+
+    return {"ok": True, "item": serialize_social_trend_todo_item(row)}
+
+
+@router.post("/todo/bulk-done")
+def bulk_mark_social_trends_todo_done(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
+
+    ids = payload.get("ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="ids must be a list")
+
+    clean_ids = [int(item_id) for item_id in ids if str(item_id).isdigit()]
+
+    if not clean_ids:
+        return {"ok": True, "updated": 0}
+
+    rows = db.query(SocialTrendTodoItem).filter(SocialTrendTodoItem.id.in_(clean_ids)).all()
+
+    for row in rows:
+        row.is_done = True
+        row.done_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"ok": True, "updated": len(rows)}
+
+
+@router.post("/todo/bulk-delete")
+def bulk_delete_social_trends_todo(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
+
+    ids = payload.get("ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="ids must be a list")
+
+    clean_ids = [int(item_id) for item_id in ids if str(item_id).isdigit()]
+
+    if not clean_ids:
+        return {"ok": True, "deleted": 0}
+
+    rows = db.query(SocialTrendTodoItem).filter(SocialTrendTodoItem.id.in_(clean_ids)).all()
+
+    for row in rows:
+        db.delete(row)
+
+    db.commit()
+
+    return {"ok": True, "deleted": len(rows)}
 
 
 @router.delete("/todo/{item_id}")
 def delete_social_trends_todo(item_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    ensure_social_trend_todo_schema(db)
     row = db.query(SocialTrendTodoItem).filter(SocialTrendTodoItem.id == item_id).first()
 
     if not row:
