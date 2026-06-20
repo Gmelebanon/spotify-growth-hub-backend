@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Session
 
 from app.core.database import Base, get_db
@@ -1306,22 +1306,23 @@ def fetch_chart(platform: str, view: str, country: str | None, limit: int, refre
 
 def ensure_social_trend_todo_schema(db: Session) -> None:
     bind = db.get_bind()
+    SocialTrendTodoItem.__table__.create(bind=bind, checkfirst=True)
     dialect = bind.dialect.name
 
     if dialect == "postgresql":
-        db.execute("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS is_done BOOLEAN NOT NULL DEFAULT FALSE")
-        db.execute("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS done_at TIMESTAMP")
+        db.execute(text("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS is_done BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS social_trend_todo_items ADD COLUMN IF NOT EXISTS done_at TIMESTAMP"))
         db.commit()
         return
 
     try:
-        db.execute("ALTER TABLE social_trend_todo_items ADD COLUMN is_done BOOLEAN NOT NULL DEFAULT 0")
+        db.execute(text("ALTER TABLE social_trend_todo_items ADD COLUMN is_done BOOLEAN NOT NULL DEFAULT 0"))
         db.commit()
     except Exception:
         db.rollback()
 
     try:
-        db.execute("ALTER TABLE social_trend_todo_items ADD COLUMN done_at TIMESTAMP")
+        db.execute(text("ALTER TABLE social_trend_todo_items ADD COLUMN done_at TIMESTAMP"))
         db.commit()
     except Exception:
         db.rollback()
@@ -1397,7 +1398,7 @@ def add_social_trends_todo(
         row = SocialTrendTodoItem(
             platform=str(raw_item.get("platform") or "").strip()[:40],
             card_title=str(raw_item.get("cardTitle") or raw_item.get("card_title") or "").strip()[:120],
-            position=int(raw_item.get("position") or 0),
+            position=int(raw_item.get("position") or 0) if str(raw_item.get("position") or "0").isdigit() else 0,
             title=title,
             artist=artist or "-",
         )
