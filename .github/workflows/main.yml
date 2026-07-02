@@ -2,7 +2,7 @@ name: Daily Playwright Auto Sync
 
 on:
   schedule:
-    - cron: "0 7 * * *" # 10:00 AM Beirut time during summer = 07:00 UTC
+    - cron: "0 7 * * *" # 10:00 AM Beirut time during summer
   workflow_dispatch:
 
 jobs:
@@ -28,6 +28,5 @@ jobs:
         run: npx playwright test tests/auto-sync.spec.ts --project=chromium
         env:
           AUTO_SYNC_URL: ${{ secrets.AUTO_SYNC_URL }}
-          AUTO_SYNC_PATH: ${{ secrets.AUTO_SYNC_PATH }}
-          AUTO_SYNC_BUTTON_TEXT: ${{ secrets.AUTO_SYNC_BUTTON_TEXT }}
-          AUTO_SYNC_SUCCESS_TEXT: ${{ secrets.AUTO_SYNC_SUCCESS_TEXT }}
+          AUTO_SYNC_USERNAME: ${{ secrets.AUTO_SYNC_USERNAME }}
+          AUTO_SYNC_PASSWORD: ${{ secrets.AUTO_SYNC_PASSWORD }}
