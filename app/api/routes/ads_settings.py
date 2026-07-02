@@ -8,32 +8,50 @@ from app.core.database import SessionLocal
 router = APIRouter()
 
 
+def ensure_playlist_visibility_columns(db: Session):
+    db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE"))
+    db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL"))
+    db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP NULL"))
+    db.commit()
+
+
+
 @router.get("/api/ads/settings")
 def get_ads_settings():
     db: Session = SessionLocal()
     try:
+        ensure_playlist_visibility_columns(db)
         result = db.execute(
             text(
                 """
                 SELECT
-                    id,
-                    playlist_id,
-                    playlist_name,
-                    account_name,
-                    genre,
-                    category,
-                    country,
-                    master_playlist,
-                    ad_date,
-                    campaign_status,
-                    budget,
-                    followers,
-                    last_synced,
-                    settings,
-                    created_at,
-                    updated_at
-                FROM ads_playlist_settings
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                    s.id,
+                    s.playlist_id,
+                    COALESCE(p.name, s.playlist_name) AS playlist_name,
+                    COALESCE(a.display_name, s.account_name) AS account_name,
+                    s.genre,
+                    s.category,
+                    s.country,
+                    s.master_playlist,
+                    s.ad_date,
+                    s.campaign_status,
+                    s.budget,
+                    COALESCE(p.followers, s.followers) AS followers,
+                    s.last_synced,
+                    s.settings,
+                    s.created_at,
+                    s.updated_at
+                FROM ads_playlist_settings s
+                JOIN playlists p
+                  ON (
+                    CAST(p.id AS TEXT) = s.playlist_id
+                    OR p.spotify_id = s.playlist_id
+                    OR p.spotify_playlist_id = s.playlist_id
+                  )
+                JOIN spotify_accounts a
+                  ON a.id = p.account_id
+                WHERE COALESCE(p.is_deleted, FALSE) = FALSE
+                ORDER BY s.updated_at DESC NULLS LAST, s.created_at DESC NULLS LAST
                 """
             )
         )
@@ -56,6 +74,29 @@ def save_ads_settings(payload: dict):
 
     db: Session = SessionLocal()
     try:
+        ensure_playlist_visibility_columns(db)
+
+        active_playlist = db.execute(
+            text(
+                """
+                SELECT p.id
+                FROM playlists p
+                JOIN spotify_accounts a ON a.id = p.account_id
+                WHERE (
+                    CAST(p.id AS TEXT) = :playlist_id
+                    OR p.spotify_id = :playlist_id
+                    OR p.spotify_playlist_id = :playlist_id
+                )
+                AND COALESCE(p.is_deleted, FALSE) = FALSE
+                LIMIT 1
+                """
+            ),
+            {"playlist_id": playlist_id},
+        ).first()
+
+        if not active_playlist:
+            raise HTTPException(status_code=404, detail="Playlist is no longer active")
+
         db.execute(
             text(
                 """
@@ -129,3 +170,41 @@ def save_ads_settings(payload: dict):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         db.close()
+
+
+@router.post("/api/ads/settings/cleanup-stale")
+def cleanup_stale_ads_settings():
+    """Delete Ads settings that point to playlists no longer present/active.
+
+    This is safe because Ads settings are UI metadata only; playlist history and
+    playlist rows remain untouched.
+    """
+    db: Session = SessionLocal()
+    try:
+        ensure_playlist_visibility_columns(db)
+        result = db.execute(
+            text(
+                """
+                DELETE FROM ads_playlist_settings s
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM playlists p
+                    JOIN spotify_accounts a ON a.id = p.account_id
+                    WHERE (
+                        CAST(p.id AS TEXT) = s.playlist_id
+                        OR p.spotify_id = s.playlist_id
+                        OR p.spotify_playlist_id = s.playlist_id
+                    )
+                    AND COALESCE(p.is_deleted, FALSE) = FALSE
+                )
+                """
+            )
+        )
+        db.commit()
+        return {"success": True, "deleted": result.rowcount or 0}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        db.close()
+
