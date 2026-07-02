@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Playwright
         run: |
-          npm init -y
+          npm install
           npm install --save-dev @playwright/test
           npx playwright install --with-deps chromium
 
