@@ -98,10 +98,7 @@ def _ensure_ads_playlist_settings_table(db: Session):
 def _load_ads_csv_seed():
     seed_path = Path(__file__).resolve().parents[2] / "data" / "ads_table_meta_seed.json"
     if not seed_path.exists():
-        raise HTTPException(
-            status_code=500,
-            detail=f"Missing seed file: {seed_path}",
-        )
+        raise HTTPException(status_code=500, detail=f"Missing seed file: {seed_path}")
 
     with seed_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -112,224 +109,65 @@ def _load_ads_csv_seed():
     return payload
 
 
-def _find_playlist_by_spotify_id(db: Session, spotify_playlist_id: str):
-    """Return the active local playlist row that matches a Spotify playlist id.
+def _normalize_seed_rows(seed_rows: list[dict]):
+    """Clean, dedupe, and keep only rows with a Spotify playlist ID."""
+    by_spotify_id = {}
 
-    This uses raw SQL so the import can run even if the SQLAlchemy model changed.
-    """
-    if not _table_exists(db, "playlists"):
-        return None
+    for row in seed_rows:
+        spotify_playlist_id = _clean_text(row.get("spotify_playlist_id") or row.get("ID") or row.get("id"))
+        if not spotify_playlist_id:
+            continue
 
-    where_parts = []
-    params = {"spotify_playlist_id": spotify_playlist_id}
+        by_spotify_id[spotify_playlist_id] = {
+            "spotify_playlist_id": spotify_playlist_id,
+            "playlist_name": _clean_text(row.get("playlist_name") or row.get("Playlist") or row.get("Name")),
+            "account_name": _clean_text(row.get("account_name") or row.get("Account")),
+            "category": _clean_text(row.get("category") or row.get("Category")),
+            "genre": _clean_text(row.get("genre") or row.get("Genre")),
+            "country": _clean_text(row.get("country") or row.get("Country")),
+            "master_playlist": _clean_text(row.get("master_playlist") or row.get("Master")),
+        }
 
-    if _column_exists(db, "playlists", "spotify_id"):
-        where_parts.append("p.spotify_id = :spotify_playlist_id")
-    if _column_exists(db, "playlists", "spotify_playlist_id"):
-        where_parts.append("p.spotify_playlist_id = :spotify_playlist_id")
-
-    if not where_parts:
-        return None
-
-    account_name_select = "NULL AS account_name"
-    join_accounts = ""
-    if _table_exists(db, "spotify_accounts") and _column_exists(db, "playlists", "account_id"):
-        account_name_columns = [
-            col for col in ["display_name", "name", "email", "spotify_user_id"]
-            if _column_exists(db, "spotify_accounts", col)
-        ]
-        if account_name_columns:
-            account_name_select = "COALESCE(" + ", ".join([f"a.{col}" for col in account_name_columns]) + ") AS account_name"
-            join_accounts = "LEFT JOIN spotify_accounts a ON a.id = p.account_id"
-
-    deleted_order = ""
-    if _column_exists(db, "playlists", "is_deleted"):
-        deleted_order = "CASE WHEN COALESCE(p.is_deleted, FALSE) = FALSE THEN 0 ELSE 1 END,"
-
-    name_select = "p.name" if _column_exists(db, "playlists", "name") else "NULL"
-    account_id_select = "p.account_id" if _column_exists(db, "playlists", "account_id") else "NULL"
-
-    query = text(
-        f"""
-        SELECT
-            p.id,
-            {name_select} AS name,
-            {account_id_select} AS account_id,
-            {account_name_select}
-        FROM playlists p
-        {join_accounts}
-        WHERE {" OR ".join(where_parts)}
-        ORDER BY {deleted_order} p.id ASC
-        LIMIT 1
-        """
-    )
-
-    return db.execute(query, params).first()
+    return list(by_spotify_id.values())
 
 
-def _upsert_ads_settings_row(db: Session, playlist_id: str, payload: dict):
-    settings_patch = {
-        "category": payload.get("category"),
-        "genre": payload.get("genre"),
-        "country": payload.get("country"),
-        "master_playlist": payload.get("master_playlist"),
-    }
-    settings_patch = {key: value for key, value in settings_patch.items() if value is not None}
+def _save_filter_options_bulk(db: Session, rows: list[dict]):
+    if not rows or not _table_exists(db, "ads_filter_options"):
+        return {"inserted_or_existing": 0}
 
-    db.execute(
-        text(
-            """
-            INSERT INTO ads_playlist_settings (
-                playlist_id,
-                playlist_name,
-                account_name,
-                category,
-                genre,
-                country,
-                master_playlist,
-                settings,
-                is_deleted,
-                deleted_at,
-                updated_at
-            ) VALUES (
-                :playlist_id,
-                :playlist_name,
-                :account_name,
-                :category,
-                :genre,
-                :country,
-                :master_playlist,
-                CAST(:settings_patch AS JSONB),
-                FALSE,
-                NULL,
-                NOW()
-            )
-            ON CONFLICT (playlist_id) DO UPDATE SET
-                playlist_name = COALESCE(EXCLUDED.playlist_name, ads_playlist_settings.playlist_name),
-                account_name = COALESCE(EXCLUDED.account_name, ads_playlist_settings.account_name),
-                category = EXCLUDED.category,
-                genre = EXCLUDED.genre,
-                country = EXCLUDED.country,
-                master_playlist = EXCLUDED.master_playlist,
-                settings = COALESCE(ads_playlist_settings.settings, '{}'::jsonb) || EXCLUDED.settings,
-                is_deleted = FALSE,
-                deleted_at = NULL,
-                updated_at = NOW()
-            """
-        ),
-        {
-            "playlist_id": playlist_id,
-            "playlist_name": payload.get("playlist_name"),
-            "account_name": payload.get("account_name"),
-            "category": payload.get("category"),
-            "genre": payload.get("genre"),
-            "country": payload.get("country"),
-            "master_playlist": payload.get("master_playlist"),
-            "settings_patch": json.dumps(settings_patch),
-        },
-    )
+    values = []
+    for row in rows:
+        if row.get("category"):
+            values.append({"option_type": "category", "value": row["category"]})
+        if row.get("genre"):
+            values.append({"option_type": "genre", "value": row["genre"]})
+        if row.get("country"):
+            values.append({"option_type": "country", "value": row["country"]})
+        if row.get("master_playlist"):
+            values.append({"option_type": "master_playlist", "value": row["master_playlist"]})
 
-
-def _update_ads_meta(db: Session, internal_playlist_id: int, payload: dict):
-    """Update ads_meta if it exists. Insert is attempted but non-fatal.
-
-    The Ads page also loads ads_playlist_settings, so ads_meta is a compatibility sync.
-    """
-    if not _table_exists(db, "ads_meta"):
-        return {"updated": 0, "inserted": 0, "skipped": True}
-
-    update_columns = []
-    params = {"playlist_id": internal_playlist_id}
-
-    for csv_key, column_name in [
-        ("category", "category"),
-        ("genre", "genre"),
-        ("country", "country"),
-        ("master_playlist", "master_playlist"),
-    ]:
-        if _column_exists(db, "ads_meta", column_name):
-            update_columns.append(f"{column_name} = :{column_name}")
-            params[column_name] = payload.get(csv_key)
-
-    if _column_exists(db, "ads_meta", "updated_at"):
-        update_columns.append("updated_at = NOW()")
-
-    if not update_columns:
-        return {"updated": 0, "inserted": 0, "skipped": True}
-
-    result = db.execute(
-        text(
-            f"""
-            UPDATE ads_meta
-            SET {", ".join(update_columns)}
-            WHERE playlist_id = :playlist_id
-            """
-        ),
-        params,
-    )
-
-    if result.rowcount and result.rowcount > 0:
-        return {"updated": result.rowcount, "inserted": 0, "skipped": False}
-
-    # Try a safe insert for playlists that do not have ads_meta yet.
-    insert_columns = ["playlist_id"]
-    insert_values = [":playlist_id"]
-    insert_params = {"playlist_id": internal_playlist_id}
-
-    for csv_key, column_name in [
-        ("category", "category"),
-        ("genre", "genre"),
-        ("country", "country"),
-        ("master_playlist", "master_playlist"),
-    ]:
-        if _column_exists(db, "ads_meta", column_name):
-            insert_columns.append(column_name)
-            insert_values.append(f":{column_name}")
-            insert_params[column_name] = payload.get(csv_key)
-
-    if _column_exists(db, "ads_meta", "created_at"):
-        insert_columns.append("created_at")
-        insert_values.append("NOW()")
-    if _column_exists(db, "ads_meta", "updated_at"):
-        insert_columns.append("updated_at")
-        insert_values.append("NOW()")
-
-    try:
-        db.execute(
-            text(
-                f"""
-                INSERT INTO ads_meta ({", ".join(insert_columns)})
-                VALUES ({", ".join(insert_values)})
-                """
-            ),
-            insert_params,
-        )
-        return {"updated": 0, "inserted": 1, "skipped": False}
-    except Exception:
-        # Avoid failing the whole CSV import if ads_meta has unexpected constraints.
-        db.rollback()
-        return {"updated": 0, "inserted": 0, "skipped": True}
-
-
-def _save_filter_option(db: Session, option_type: str, value: str | None):
-    value = _clean_text(value)
-    if not value or not _table_exists(db, "ads_filter_options"):
-        return
+    unique_values = list({(item["option_type"], item["value"]): item for item in values}.values())
+    if not unique_values:
+        return {"inserted_or_existing": 0}
 
     try:
         db.execute(
             text(
                 """
                 INSERT INTO ads_filter_options (option_type, value)
-                VALUES (:option_type, :value)
+                SELECT option_type, value
+                FROM jsonb_to_recordset(CAST(:rows AS JSONB))
+                AS x(option_type TEXT, value TEXT)
                 ON CONFLICT (option_type, value) DO NOTHING
                 """
             ),
-            {"option_type": option_type, "value": value},
+            {"rows": json.dumps(unique_values)},
         )
     except Exception:
-        # Non-fatal; old DBs may not have a unique index here.
+        # Keep import successful even if old DB has no matching unique constraint.
         pass
+
+    return {"inserted_or_existing": len(unique_values)}
 
 
 @router.get("/api/ads/settings")
@@ -384,18 +222,9 @@ def save_ads_settings(payload: dict):
         raise HTTPException(status_code=400, detail="playlist_id is required")
 
     settings = payload.get("settings") or {}
-    if payload.get("ads") is not None:
-        settings["ads"] = payload.get("ads")
-    if payload.get("color") is not None:
-        settings["color"] = payload.get("color")
-    if payload.get("category") is not None:
-        settings["category"] = payload.get("category")
-    if payload.get("genre") is not None:
-        settings["genre"] = payload.get("genre")
-    if payload.get("country") is not None:
-        settings["country"] = payload.get("country")
-    if payload.get("master_playlist") is not None:
-        settings["master_playlist"] = payload.get("master_playlist")
+    for key in ["ads", "color", "category", "genre", "country", "master_playlist"]:
+        if payload.get(key) is not None:
+            settings[key] = payload.get(key)
 
     db: Session = SessionLocal()
     try:
@@ -484,120 +313,315 @@ def save_ads_settings(payload: dict):
 
 @router.post("/api/ads/settings/import-csv-meta")
 def import_ads_settings_meta_from_csv_seed():
-    """Import Category, Genre, Country, and Master from the uploaded Ads CSV seed.
+    """Fast bulk import for Category, Genre, Country, and Master from the Ads CSV seed.
 
-    Matches rows by CSV Spotify playlist ID against playlists.spotify_id / spotify_playlist_id.
-    If a playlist exists locally, the ads_playlist_settings row is stored under the local playlist id,
-    which matches what the Ads page autosave uses.
+    This avoids the older slow row-by-row import. It:
+    - loads the JSON seed
+    - dedupes by Spotify playlist ID
+    - bulk-matches against playlists.spotify_id / spotify_playlist_id
+    - bulk-upserts ads_playlist_settings
+    - bulk-updates ads_meta and playlists.genre when those tables/columns exist
     """
     seed_rows = _load_ads_csv_seed()
+    rows = _normalize_seed_rows(seed_rows)
+
+    if not rows:
+        return {
+            "success": True,
+            "source": "ads_table_meta_seed.json",
+            "total_seed_rows": len(seed_rows),
+            "processed": 0,
+            "settings_upserted": 0,
+            "matched_playlists": 0,
+            "missing_local_playlist": 0,
+        }
 
     db: Session = SessionLocal()
     try:
         _ensure_ads_playlist_settings_table(db)
 
-        total = 0
-        matched_playlists = 0
-        settings_upserted = 0
+        playlist_has_spotify_id = _column_exists(db, "playlists", "spotify_id")
+        playlist_has_spotify_playlist_id = _column_exists(db, "playlists", "spotify_playlist_id")
+        playlist_has_genre = _column_exists(db, "playlists", "genre")
+
+        match_conditions = []
+        if playlist_has_spotify_id:
+            match_conditions.append("p.spotify_id = s.spotify_playlist_id")
+        if playlist_has_spotify_playlist_id:
+            match_conditions.append("p.spotify_playlist_id = s.spotify_playlist_id")
+
+        if not match_conditions:
+            # Fallback: import settings by Spotify ID only.
+            match_sql = "FALSE"
+        else:
+            match_sql = " OR ".join(match_conditions)
+
+        db.execute(text("DROP TABLE IF EXISTS tmp_ads_csv_meta_import"))
+        db.execute(
+            text(
+                """
+                CREATE TEMP TABLE tmp_ads_csv_meta_import (
+                    spotify_playlist_id TEXT PRIMARY KEY,
+                    playlist_name TEXT,
+                    account_name TEXT,
+                    category TEXT,
+                    genre TEXT,
+                    country TEXT,
+                    master_playlist TEXT
+                ) ON COMMIT DROP
+                """
+            )
+        )
+
+        db.execute(
+            text(
+                """
+                INSERT INTO tmp_ads_csv_meta_import (
+                    spotify_playlist_id,
+                    playlist_name,
+                    account_name,
+                    category,
+                    genre,
+                    country,
+                    master_playlist
+                )
+                SELECT
+                    spotify_playlist_id,
+                    playlist_name,
+                    account_name,
+                    category,
+                    genre,
+                    country,
+                    master_playlist
+                FROM jsonb_to_recordset(CAST(:rows AS JSONB))
+                AS x(
+                    spotify_playlist_id TEXT,
+                    playlist_name TEXT,
+                    account_name TEXT,
+                    category TEXT,
+                    genre TEXT,
+                    country TEXT,
+                    master_playlist TEXT
+                )
+                """
+            ),
+            {"rows": json.dumps(rows)},
+        )
+
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_tmp_ads_csv_meta_import_spotify_id ON tmp_ads_csv_meta_import (spotify_playlist_id)"))
+
+        # Resolve each CSV row to the local playlist id when it exists.
+        db.execute(text("DROP TABLE IF EXISTS tmp_ads_csv_meta_resolved"))
+        db.execute(
+            text(
+                f"""
+                CREATE TEMP TABLE tmp_ads_csv_meta_resolved AS
+                SELECT DISTINCT ON (s.spotify_playlist_id)
+                    s.spotify_playlist_id,
+                    COALESCE(CAST(p.id AS TEXT), s.spotify_playlist_id) AS settings_playlist_id,
+                    p.id AS local_playlist_id,
+                    COALESCE(s.playlist_name, p.name) AS playlist_name,
+                    s.account_name,
+                    s.category,
+                    s.genre,
+                    s.country,
+                    s.master_playlist
+                FROM tmp_ads_csv_meta_import s
+                LEFT JOIN playlists p
+                    ON ({match_sql})
+                ORDER BY
+                    s.spotify_playlist_id,
+                    CASE WHEN p.id IS NULL THEN 1 ELSE 0 END,
+                    CASE WHEN COALESCE(p.is_deleted, FALSE) = FALSE THEN 0 ELSE 1 END,
+                    p.id ASC
+                """
+            )
+        )
+
+        count_row = db.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS processed,
+                    COUNT(local_playlist_id) AS matched_playlists,
+                    COUNT(*) - COUNT(local_playlist_id) AS missing_local_playlist
+                FROM tmp_ads_csv_meta_resolved
+                """
+            )
+        ).first()
+
+        upsert_result = db.execute(
+            text(
+                """
+                INSERT INTO ads_playlist_settings (
+                    playlist_id,
+                    playlist_name,
+                    account_name,
+                    category,
+                    genre,
+                    country,
+                    master_playlist,
+                    settings,
+                    is_deleted,
+                    deleted_at,
+                    updated_at
+                )
+                SELECT
+                    settings_playlist_id,
+                    playlist_name,
+                    account_name,
+                    category,
+                    genre,
+                    country,
+                    master_playlist,
+                    jsonb_strip_nulls(jsonb_build_object(
+                        'category', category,
+                        'genre', genre,
+                        'country', country,
+                        'master_playlist', master_playlist
+                    )),
+                    FALSE,
+                    NULL,
+                    NOW()
+                FROM tmp_ads_csv_meta_resolved
+                ON CONFLICT (playlist_id) DO UPDATE SET
+                    playlist_name = COALESCE(EXCLUDED.playlist_name, ads_playlist_settings.playlist_name),
+                    account_name = COALESCE(EXCLUDED.account_name, ads_playlist_settings.account_name),
+                    category = EXCLUDED.category,
+                    genre = EXCLUDED.genre,
+                    country = EXCLUDED.country,
+                    master_playlist = EXCLUDED.master_playlist,
+                    settings = COALESCE(ads_playlist_settings.settings, '{}'::jsonb) || EXCLUDED.settings,
+                    is_deleted = FALSE,
+                    deleted_at = NULL,
+                    updated_at = NOW()
+                """
+            )
+        )
+
+        # Also update older settings saved by Spotify ID when local id is used.
+        db.execute(
+            text(
+                """
+                UPDATE ads_playlist_settings old
+                SET
+                    category = r.category,
+                    genre = r.genre,
+                    country = r.country,
+                    master_playlist = r.master_playlist,
+                    settings = COALESCE(old.settings, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
+                        'category', r.category,
+                        'genre', r.genre,
+                        'country', r.country,
+                        'master_playlist', r.master_playlist
+                    )),
+                    is_deleted = FALSE,
+                    deleted_at = NULL,
+                    updated_at = NOW()
+                FROM tmp_ads_csv_meta_resolved r
+                WHERE old.playlist_id = r.spotify_playlist_id
+                  AND old.playlist_id <> r.settings_playlist_id
+                """
+            )
+        )
+
         ads_meta_updated = 0
         ads_meta_inserted = 0
-        missing_local_playlist = 0
-        skipped_no_id = 0
 
-        for seed in seed_rows:
-            spotify_playlist_id = _clean_text(seed.get("spotify_playlist_id"))
-            if not spotify_playlist_id:
-                skipped_no_id += 1
-                continue
-
-            total += 1
-
-            local_playlist = _find_playlist_by_spotify_id(db, spotify_playlist_id)
-            local_playlist_id = None
-            playlist_id_for_settings = spotify_playlist_id
-
-            payload = {
-                "playlist_name": _clean_text(seed.get("playlist_name")),
-                "account_name": _clean_text(seed.get("account_name")),
-                "category": _clean_text(seed.get("category")),
-                "genre": _clean_text(seed.get("genre")),
-                "country": _clean_text(seed.get("country")),
-                "master_playlist": _clean_text(seed.get("master_playlist")),
+        if _table_exists(db, "ads_meta"):
+            ads_meta_columns = {
+                col: _column_exists(db, "ads_meta", col)
+                for col in ["category", "genre", "country", "master_playlist", "created_at", "updated_at"]
             }
 
-            if local_playlist:
-                matched_playlists += 1
-                local_playlist_id = int(local_playlist.id)
-                playlist_id_for_settings = str(local_playlist_id)
-                payload["playlist_name"] = payload["playlist_name"] or _clean_text(local_playlist.name)
-                payload["account_name"] = payload["account_name"] or _clean_text(local_playlist.account_name)
-            else:
-                missing_local_playlist += 1
+            set_parts = []
+            for column in ["category", "genre", "country", "master_playlist"]:
+                if ads_meta_columns[column]:
+                    set_parts.append(f"{column} = r.{column}")
+            if ads_meta_columns["updated_at"]:
+                set_parts.append("updated_at = NOW()")
 
-            _upsert_ads_settings_row(db, playlist_id_for_settings, payload)
-            settings_upserted += 1
-
-            # Also update legacy rows that might have been saved by Spotify ID before.
-            if playlist_id_for_settings != spotify_playlist_id:
-                db.execute(
+            if set_parts:
+                result = db.execute(
                     text(
+                        f"""
+                        UPDATE ads_meta m
+                        SET {", ".join(set_parts)}
+                        FROM tmp_ads_csv_meta_resolved r
+                        WHERE m.playlist_id = r.local_playlist_id
                         """
-                        UPDATE ads_playlist_settings
-                        SET
-                            category = :category,
-                            genre = :genre,
-                            country = :country,
-                            master_playlist = :master_playlist,
-                            settings = COALESCE(settings, '{}'::jsonb) || CAST(:settings_patch AS JSONB),
-                            is_deleted = FALSE,
-                            deleted_at = NULL,
-                            updated_at = NOW()
-                        WHERE playlist_id = :spotify_playlist_id
-                        """
-                    ),
-                    {
-                        "spotify_playlist_id": spotify_playlist_id,
-                        "category": payload.get("category"),
-                        "genre": payload.get("genre"),
-                        "country": payload.get("country"),
-                        "master_playlist": payload.get("master_playlist"),
-                        "settings_patch": json.dumps({
-                            key: value for key, value in {
-                                "category": payload.get("category"),
-                                "genre": payload.get("genre"),
-                                "country": payload.get("country"),
-                                "master_playlist": payload.get("master_playlist"),
-                            }.items() if value is not None
-                        }),
-                    },
+                    )
                 )
+                ads_meta_updated = result.rowcount or 0
 
-            if local_playlist_id is not None:
-                meta_result = _update_ads_meta(db, local_playlist_id, payload)
-                ads_meta_updated += meta_result.get("updated", 0) or 0
-                ads_meta_inserted += meta_result.get("inserted", 0) or 0
+                insert_columns = ["playlist_id"]
+                select_columns = ["r.local_playlist_id"]
+                for column in ["category", "genre", "country", "master_playlist"]:
+                    if ads_meta_columns[column]:
+                        insert_columns.append(column)
+                        select_columns.append(f"r.{column}")
+                if ads_meta_columns["created_at"]:
+                    insert_columns.append("created_at")
+                    select_columns.append("NOW()")
+                if ads_meta_columns["updated_at"]:
+                    insert_columns.append("updated_at")
+                    select_columns.append("NOW()")
 
-                if payload.get("genre") and _column_exists(db, "playlists", "genre"):
-                    db.execute(
-                        text("UPDATE playlists SET genre = :genre WHERE id = :playlist_id"),
-                        {"genre": payload.get("genre"), "playlist_id": local_playlist_id},
+                try:
+                    result = db.execute(
+                        text(
+                            f"""
+                            INSERT INTO ads_meta ({", ".join(insert_columns)})
+                            SELECT {", ".join(select_columns)}
+                            FROM tmp_ads_csv_meta_resolved r
+                            LEFT JOIN ads_meta m ON m.playlist_id = r.local_playlist_id
+                            WHERE r.local_playlist_id IS NOT NULL
+                              AND m.playlist_id IS NULL
+                            """
+                        )
+                    )
+                    ads_meta_inserted = result.rowcount or 0
+                except Exception:
+                    # If ads_meta has extra required columns/constraints, the settings import still succeeds.
+                    db.rollback()
+                    # Recreate temp tables are gone after rollback, so fail cleanly with useful details.
+                    raise HTTPException(
+                        status_code=500,
+                        detail="ads_playlist_settings import succeeded until ads_meta insert, but ads_meta has incompatible constraints. Use v2b without ads_meta insert or send Render logs.",
                     )
 
-            _save_filter_option(db, "category", payload.get("category"))
-            _save_filter_option(db, "genre", payload.get("genre"))
+        playlists_genre_updated = 0
+        if playlist_has_genre:
+            result = db.execute(
+                text(
+                    """
+                    UPDATE playlists p
+                    SET genre = r.genre
+                    FROM tmp_ads_csv_meta_resolved r
+                    WHERE p.id = r.local_playlist_id
+                      AND r.genre IS NOT NULL
+                    """
+                )
+            )
+            playlists_genre_updated = result.rowcount or 0
+
+        filter_result = _save_filter_options_bulk(db, rows)
 
         db.commit()
+
         return {
             "success": True,
             "source": "ads_table_meta_seed.json",
+            "mode": "fast-bulk-v2",
             "total_seed_rows": len(seed_rows),
-            "processed": total,
-            "matched_playlists": matched_playlists,
-            "missing_local_playlist": missing_local_playlist,
-            "settings_upserted": settings_upserted,
+            "processed": int(count_row.processed or 0),
+            "matched_playlists": int(count_row.matched_playlists or 0),
+            "missing_local_playlist": int(count_row.missing_local_playlist or 0),
+            "settings_upserted": upsert_result.rowcount or len(rows),
             "ads_meta_updated": ads_meta_updated,
             "ads_meta_inserted": ads_meta_inserted,
-            "skipped_no_id": skipped_no_id,
+            "playlists_genre_updated": playlists_genre_updated,
+            "filter_options_seen": filter_result["inserted_or_existing"],
         }
     except HTTPException:
         db.rollback()
@@ -611,10 +635,6 @@ def import_ads_settings_meta_from_csv_seed():
 
 @router.post("/api/ads/settings/cleanup-stale")
 def cleanup_stale_ads_settings():
-    """Hide/delete ads settings that belong to playlists marked deleted/missing.
-
-    This keeps Ads from showing settings for Spotify playlists that are no longer active.
-    """
     db: Session = SessionLocal()
     try:
         _ensure_ads_playlist_settings_table(db)
@@ -638,10 +658,7 @@ def cleanup_stale_ads_settings():
         )
 
         db.commit()
-        return {
-            "success": True,
-            "deleted": result.rowcount or 0,
-        }
+        return {"success": True, "deleted": result.rowcount or 0}
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
