@@ -24,14 +24,18 @@ jobs:
           npm --version
           npx --version
 
+      - name: Clean old installed modules
+        run: |
+          rm -rf node_modules
+          rm -f package-lock.json
+
       - name: Install Playwright
         run: |
-          npm install
           npm install --save-dev @playwright/test
-          npx playwright install --with-deps chromium
+          node ./node_modules/playwright/cli.js install --with-deps chromium
 
       - name: Run website auto sync
-        run: npx playwright test tests/auto-sync.spec.ts --project=chromium
+        run: node ./node_modules/@playwright/test/cli.js test tests/auto-sync.spec.ts --project=chromium
         env:
           AUTO_SYNC_URL: ${{ secrets.AUTO_SYNC_URL }}
           AUTO_SYNC_USERNAME: ${{ secrets.AUTO_SYNC_USERNAME }}
