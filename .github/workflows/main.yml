@@ -1,42 +1,100 @@
-name: Daily Playwright Auto Sync
+name: Daily Backend Auto Sync
 
 on:
   schedule:
-    - cron: "0 7 * * *" # 10:00 AM Beirut time during summer
+    # GitHub cron runs in UTC. 07:00 UTC = 10:00 AM Beirut during summer time.
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      BACKEND_BASE_URL: https://spotify-growth-hub-backend.onrender.com
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Check Node install
+      - name: Wake backend
         run: |
-          node --version
-          npm --version
-          npx --version
+          echo "Waking backend..."
+          curl -L --retry 3 --retry-delay 10 --max-time 90 "$BACKEND_BASE_URL/api/playlists/sync-all" || true
+          echo "Backend wake request finished."
 
-      - name: Clean old installed modules
+      - name: Run playlist Sync All
         run: |
-          rm -rf node_modules
-          rm -f package-lock.json
+          set -euo pipefail
+          echo "Starting backend playlist sync..."
+          RESPONSE_FILE="sync-all-response.json"
+          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 900 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -o "$RESPONSE_FILE" \
+            -w "%{http_code}" \
+            "$BACKEND_BASE_URL/api/playlists/sync-all")
 
-      - name: Install Playwright
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response:"
+          cat "$RESPONSE_FILE"
+          echo ""
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Sync All failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          if grep -qi '"success"[[:space:]]*:[[:space:]]*false' "$RESPONSE_FILE"; then
+            echo "Sync All response says success=false"
+            exit 1
+          fi
+
+          echo "Playlist Sync All completed."
+
+      - name: Cleanup stale playlists
         run: |
-          npm install --save-dev @playwright/test
-          node ./node_modules/playwright/cli.js install --with-deps chromium
+          set -euo pipefail
+          echo "Cleaning stale playlists..."
+          RESPONSE_FILE="cleanup-playlists-response.json"
+          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 300 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -o "$RESPONSE_FILE" \
+            -w "%{http_code}" \
+            "$BACKEND_BASE_URL/api/playlists/cleanup-stale")
 
-      - name: Run website auto sync
-        run: node ./node_modules/@playwright/test/cli.js test tests/auto-sync.spec.ts --project=chromium
-        env:
-          AUTO_SYNC_URL: ${{ secrets.AUTO_SYNC_URL }}
-          AUTO_SYNC_USERNAME: ${{ secrets.AUTO_SYNC_USERNAME }}
-          AUTO_SYNC_PASSWORD: ${{ secrets.AUTO_SYNC_PASSWORD }}
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response:"
+          cat "$RESPONSE_FILE"
+          echo ""
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Playlist cleanup failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Cleanup stale Ads settings
+        run: |
+          set -euo pipefail
+          echo "Cleaning stale Ads settings..."
+          RESPONSE_FILE="cleanup-ads-response.json"
+          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 300 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -o "$RESPONSE_FILE" \
+            -w "%{http_code}" \
+            "$BACKEND_BASE_URL/api/ads/settings/cleanup-stale")
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response:"
+          cat "$RESPONSE_FILE"
+          echo ""
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Ads cleanup failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Final sync status
+        run: |
+          echo "Fetching final sync status..."
+          curl -L --max-time 90 "$BACKEND_BASE_URL/api/playlists/sync-all"
