@@ -1,100 +1,87 @@
-name: Daily Backend Auto Sync
+name: Daily Backend Sync
 
 on:
   schedule:
-    # GitHub cron runs in UTC. 07:00 UTC = 10:00 AM Beirut during summer time.
+    # GitHub cron uses UTC. 07:00 UTC = 10:00 Beirut during UTC+3 / summer time.
     - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    env:
-      BACKEND_BASE_URL: https://spotify-growth-hub-backend.onrender.com
+    timeout-minutes: 40
 
     steps:
       - name: Wake backend
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Waking backend..."
-          curl -L --retry 3 --retry-delay 10 --max-time 90 "$BACKEND_BASE_URL/api/playlists/sync-all" || true
-          echo "Backend wake request finished."
+          curl -L --connect-timeout 20 --max-time 90             "https://spotify-growth-hub-backend.onrender.com/api/playlists/sync-all"             || true
+          echo ""
 
       - name: Run playlist Sync All
+        shell: bash
         run: |
           set -euo pipefail
           echo "Starting backend playlist sync..."
-          RESPONSE_FILE="sync-all-response.json"
-          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 900 \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            "$BACKEND_BASE_URL/api/playlists/sync-all")
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_STATUS="$(curl -L -sS -X POST             --connect-timeout 30             --max-time 2100             -o "$RESPONSE_FILE"             -w "%{http_code}"             "https://spotify-growth-hub-backend.onrender.com/api/playlists/sync-all")"
 
-          echo "HTTP status: $HTTP_CODE"
+          echo "HTTP status: $HTTP_STATUS"
           echo "Response:"
           cat "$RESPONSE_FILE"
           echo ""
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Sync All failed with HTTP $HTTP_CODE"
-            exit 1
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Playlist Sync All completed."
+            exit 0
           fi
 
-          if grep -qi '"success"[[:space:]]*:[[:space:]]*false' "$RESPONSE_FILE"; then
-            echo "Sync All response says success=false"
-            exit 1
+          if [ "$HTTP_STATUS" = "429" ]; then
+            if grep -qi "cooldown" "$RESPONSE_FILE"; then
+              echo "Sync All is in cooldown after a recent successful sync. Continuing."
+              exit 0
+            fi
           fi
 
-          echo "Playlist Sync All completed."
+          echo "Sync All failed with HTTP $HTTP_STATUS"
+          exit 1
 
-      - name: Cleanup stale playlists
-        run: |
-          set -euo pipefail
-          echo "Cleaning stale playlists..."
-          RESPONSE_FILE="cleanup-playlists-response.json"
-          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 300 \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            "$BACKEND_BASE_URL/api/playlists/cleanup-stale")
-
-          echo "HTTP status: $HTTP_CODE"
-          echo "Response:"
-          cat "$RESPONSE_FILE"
-          echo ""
-
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Playlist cleanup failed with HTTP $HTTP_CODE"
-            exit 1
-          fi
+      # Sync All already marks stale/deleted Spotify playlists as hidden.
+      # This separate playlist cleanup endpoint can be slow and is not required for daily sync.
+      # Keep it disabled unless we need a one-time cleanup.
+      # - name: Cleanup stale playlists
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     curl -L -X POST --connect-timeout 30 --max-time 300       #       "https://spotify-growth-hub-backend.onrender.com/api/playlists/cleanup-stale"
 
       - name: Cleanup stale Ads settings
+        shell: bash
         run: |
           set -euo pipefail
           echo "Cleaning stale Ads settings..."
-          RESPONSE_FILE="cleanup-ads-response.json"
-          HTTP_CODE=$(curl -L -sS --retry 2 --retry-delay 10 --max-time 300 \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            "$BACKEND_BASE_URL/api/ads/settings/cleanup-stale")
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_STATUS="$(curl -L -sS -X POST             --connect-timeout 30             --max-time 300             -o "$RESPONSE_FILE"             -w "%{http_code}"             "https://spotify-growth-hub-backend.onrender.com/api/ads/settings/cleanup-stale")"
 
-          echo "HTTP status: $HTTP_CODE"
+          echo "HTTP status: $HTTP_STATUS"
           echo "Response:"
           cat "$RESPONSE_FILE"
           echo ""
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Ads cleanup failed with HTTP $HTTP_CODE"
-            exit 1
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Ads cleanup completed."
+            exit 0
           fi
 
+          echo "Ads cleanup failed with HTTP $HTTP_STATUS"
+          exit 1
+
       - name: Final sync status
+        shell: bash
         run: |
-          echo "Fetching final sync status..."
-          curl -L --max-time 90 "$BACKEND_BASE_URL/api/playlists/sync-all"
+          set -euo pipefail
+          echo "Final backend sync status:"
+          curl -L -sS --connect-timeout 20 --max-time 90             "https://spotify-growth-hub-backend.onrender.com/api/playlists/sync-all"
+          echo ""
