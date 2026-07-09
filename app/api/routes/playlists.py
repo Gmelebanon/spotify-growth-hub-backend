@@ -11,7 +11,6 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import text, bindparam
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -97,7 +96,7 @@ def get_account_or_404(db: Session, account_id: int):
 
 def get_playlist_or_404(db: Session, account_id: int, playlist_id: int):
     playlist = (
-        active_playlist_query(db)
+        db.query(Playlist)
         .filter(Playlist.id == playlist_id, Playlist.account_id == account_id)
         .first()
     )
@@ -109,109 +108,6 @@ def get_playlist_or_404(db: Session, account_id: int, playlist_id: int):
 def safe_set(model, field: str, value):
     if hasattr(model, field):
         setattr(model, field, value)
-
-
-def ensure_playlist_visibility_columns(db: Session):
-    """Create soft-delete columns used to hide Spotify playlists removed from accounts.
-
-    Base.metadata.create_all creates missing tables, but it does not add new columns
-    to existing Render/Postgres tables. These ALTER statements are safe to run many
-    times and let the cleanup/filter code work on older databases.
-    """
-    try:
-        db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE"))
-        db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL"))
-        db.execute(text("ALTER TABLE playlists ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP NULL"))
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-
-
-def active_playlist_query(db: Session):
-    ensure_playlist_visibility_columns(db)
-    return db.query(Playlist).filter(text("COALESCE(playlists.is_deleted, FALSE) = FALSE"))
-
-
-def mark_playlist_ids_visibility(db: Session, playlist_ids: list[int], is_deleted: bool, now: datetime):
-    if not playlist_ids:
-        return 0
-
-    if is_deleted:
-        stmt = text("""
-            UPDATE playlists
-            SET is_deleted = TRUE,
-                deleted_at = COALESCE(deleted_at, :now),
-                updated_at = :now
-            WHERE id IN :ids
-        """).bindparams(bindparam("ids", expanding=True))
-    else:
-        stmt = text("""
-            UPDATE playlists
-            SET is_deleted = FALSE,
-                deleted_at = NULL,
-                last_seen_at = :now,
-                updated_at = :now
-            WHERE id IN :ids
-        """).bindparams(bindparam("ids", expanding=True))
-
-    result = db.execute(stmt, {"ids": playlist_ids, "now": now})
-    return result.rowcount or 0
-
-
-def mark_account_missing_playlists_deleted(
-    db: Session,
-    account_id: int,
-    live_spotify_ids: list[str],
-    now: datetime,
-):
-    """Mark database playlists as deleted when Spotify no longer returns them.
-
-    This is the main fix for ghost playlists: they remain in history/database,
-    but normal Playlists and Ads endpoints stop showing them.
-    """
-    ensure_playlist_visibility_columns(db)
-
-    live_set = {str(item) for item in live_spotify_ids if item}
-    account_playlists = db.query(Playlist).filter(Playlist.account_id == account_id).all()
-
-    stale_ids: list[int] = []
-    live_existing_ids: list[int] = []
-
-    for playlist in account_playlists:
-        spotify_id = getattr(playlist, "spotify_id", None) or getattr(playlist, "spotify_playlist_id", None)
-        if spotify_id and str(spotify_id) in live_set:
-            live_existing_ids.append(playlist.id)
-        elif spotify_id:
-            stale_ids.append(playlist.id)
-
-    hidden = mark_playlist_ids_visibility(db, stale_ids, True, now)
-    restored = mark_playlist_ids_visibility(db, live_existing_ids, False, now)
-
-    return {"hidden": hidden, "restored": restored}
-
-
-def hide_playlist_orphans_without_accounts(db: Session):
-    """Hide playlist rows whose account no longer exists."""
-    ensure_playlist_visibility_columns(db)
-    now = datetime.utcnow()
-    result = db.execute(
-        text("""
-            UPDATE playlists p
-            SET is_deleted = TRUE,
-                deleted_at = COALESCE(deleted_at, :now),
-                updated_at = :now
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM spotify_accounts a
-                WHERE a.id = p.account_id
-            )
-            AND COALESCE(p.is_deleted, FALSE) = FALSE
-        """),
-        {"now": now},
-    )
-    db.commit()
-    return result.rowcount or 0
 
 
 def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
@@ -393,16 +289,28 @@ def today_utc_date():
 
 
 def compute_growth_stats(playlist: Playlist, history_rows):
-    now = datetime.utcnow()
+    """Calculate summaries from daily growth rows.
+
+    follower_history.followers stores the daily growth value in this project,
+    not a historical total follower snapshot. Therefore 7D and 30D must be
+    sums of daily values, never current followers minus a history row.
+    """
     current = getattr(playlist, "followers", 0) or 0
+    today = datetime.utcnow().date()
+    latest_by_date = _latest_history_by_date(history_rows)
 
-    followers_24h = closest_followers_at_or_before(history_rows, now - timedelta(days=1))
-    followers_7d = closest_followers_at_or_before(history_rows, now - timedelta(days=7))
-    followers_30d = closest_followers_at_or_before(history_rows, now - timedelta(days=30))
+    def sum_days(days: int) -> int:
+        total = 0
+        for offset in range(days):
+            day_key = (today - timedelta(days=offset)).isoformat()
+            row = latest_by_date.get(day_key)
+            if row:
+                total += int(getattr(row, "followers", 0) or 0)
+        return total
 
-    growth_24h = current - followers_24h if followers_24h is not None else 0
-    growth_7d = current - followers_7d if followers_7d is not None else 0
-    growth_30d = current - followers_30d if followers_30d is not None else 0
+    growth_24h = sum_days(1)
+    growth_7d = sum_days(7)
+    growth_30d = sum_days(30)
 
     return {
         "followers": current,
@@ -800,7 +708,6 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     now = datetime.utcnow()
 
     spotify_ids = [item.get("id") for item in spotify_items if item.get("id")]
-    visibility_result = mark_account_missing_playlists_deleted(db, account_id, spotify_ids, now)
 
     existing_playlists = (
         db.query(Playlist)
@@ -851,7 +758,6 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
         db.add(playlist)
         db.flush()
-        mark_playlist_ids_visibility(db, [playlist.id], False, now)
 
         _, inserted = save_daily_growth_history_from_map(
             db,
@@ -873,8 +779,6 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
         "history_inserted": history_inserted,
         "history_updated": history_updated,
         "total": len(spotify_items),
-        "hidden": visibility_result.get("hidden", 0),
-        "restored": visibility_result.get("restored", 0),
     }
 
 
@@ -940,7 +844,7 @@ def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spo
 @router.get("/api/accounts/{account_id}/playlists")
 def get_playlists_api(account_id: int, db: Session = Depends(get_db)):
     playlists = (
-        active_playlist_query(db)
+        db.query(Playlist)
         .filter(Playlist.account_id == account_id)
         .order_by(Playlist.name.asc())
         .all()
@@ -984,7 +888,7 @@ def sync_account_playlists_api(
     result = refresh_account_playlists_from_spotify(db, account_id)
 
     playlists = (
-        active_playlist_query(db)
+        db.query(Playlist)
         .filter(Playlist.account_id == account_id)
         .order_by(Playlist.id.asc())
         .offset(offset)
@@ -1005,8 +909,6 @@ def sync_account_playlists_api(
         "imported": result["imported"],
         "updated": result["updated"],
         "total": result["total"],
-        "hidden": result.get("hidden", 0),
-        "restored": result.get("restored", 0),
         "history_inserted": result.get("history_inserted", 0),
         "history_updated": result.get("history_updated", 0),
         "items": serialize_playlist_batch(
@@ -1345,8 +1247,6 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
         history_inserted = 0
         history_updated = 0
         total_playlists = 0
-        total_hidden = 0
-        total_restored = 0
 
         for index, account_id in enumerate(account_ids):
             try:
@@ -1355,8 +1255,6 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
                 history_inserted += result.get("history_inserted", 0)
                 history_updated += result.get("history_updated", 0)
                 total_playlists += result.get("total", 0)
-                total_hidden += result.get("hidden", 0)
-                total_restored += result.get("restored", 0)
                 print(f"Synced account {account_id}: {result}")
             except Exception as exc:
                 db.rollback()
@@ -1377,8 +1275,6 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
             "history_inserted": history_inserted,
             "history_updated": history_updated,
             "total_playlists": total_playlists,
-            "hidden": total_hidden,
-            "restored": total_restored,
         }
         return result_payload
 
@@ -1397,59 +1293,6 @@ def sync_all_playlists_get_api():
     heavy Spotify sync job.
     """
     return {"success": True, "message": "Use POST to start Sync All", "status": get_sync_all_status()}
-
-
-
-@router.post("/api/playlists/cleanup-stale")
-def cleanup_stale_playlists_api(db: Session = Depends(get_db)):
-    """One-time/manual cleanup.
-
-    It refreshes every connected account from Spotify and hides any playlist that
-    no longer appears in that account. It also hides orphan playlist rows whose
-    account record was deleted.
-    """
-    hidden_orphans = hide_playlist_orphans_without_accounts(db)
-
-    account_ids = [
-        account.id
-        for account in db.query(SpotifyAccount).order_by(SpotifyAccount.id.asc()).all()
-    ]
-
-    synced = 0
-    failed = []
-    hidden = hidden_orphans
-    restored = 0
-    total_playlists = 0
-
-    for account_id in account_ids:
-        try:
-            result = refresh_account_playlists_from_spotify(db, account_id)
-            synced += 1
-            hidden += result.get("hidden", 0)
-            restored += result.get("restored", 0)
-            total_playlists += result.get("total", 0)
-        except Exception as exc:
-            db.rollback()
-            failed.append({"account_id": account_id, "error": str(exc)})
-
-    return {
-        "success": len(failed) == 0,
-        "message": "Stale playlist cleanup completed",
-        "accounts": len(account_ids),
-        "synced": synced,
-        "failed": failed,
-        "hidden": hidden,
-        "restored": restored,
-        "total_playlists": total_playlists,
-    }
-
-
-@router.get("/api/playlists/cleanup-stale")
-def cleanup_stale_playlists_status_api():
-    return {
-        "success": True,
-        "message": "Use POST to run stale playlist cleanup.",
-    }
 
 
 class CreatePlaylistRequest(BaseModel):
@@ -1655,7 +1498,7 @@ def update_playlist_genre(
     payload: UpdatePlaylistGenreRequest,
     db: Session = Depends(get_db),
 ):
-    playlist = active_playlist_query(db).filter(Playlist.id == playlist_id).first()
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
 
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -1675,7 +1518,7 @@ def update_playlist_genre(
 
 @router.get("/api/playlists/{playlist_id}/ads-meta")
 def get_ads_meta(playlist_id: int, db: Session = Depends(get_db)):
-    playlist = active_playlist_query(db).filter(Playlist.id == playlist_id).first()
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
 
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -1690,7 +1533,7 @@ def update_ads_meta(
     payload: UpdateAdsMetaRequest,
     db: Session = Depends(get_db),
 ):
-    playlist = active_playlist_query(db).filter(Playlist.id == playlist_id).first()
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
 
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
