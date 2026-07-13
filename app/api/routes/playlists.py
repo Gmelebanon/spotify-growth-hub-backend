@@ -495,19 +495,55 @@ def fetch_spotify_account_playlists(db: Session, account: SpotifyAccount):
 
 
 def fetch_spotify_playlist_detail(db: Session, account: SpotifyAccount, spotify_playlist_id: str):
+    """Fetch a fresh playlist snapshot including the current Spotify save count.
+
+    Spotify's fields syntax for nested objects must explicitly request
+    followers(total). The previous request used `followers,total`, which can
+    return incomplete follower data and leave the database with an old value.
+    """
+    endpoint = f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}"
+
     response = spotify_request(
         db,
         account,
         "GET",
-        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}",
-        params={"fields": "id,name,description,followers,total,images,tracks.total,external_urls"},
+        endpoint,
+        params={
+            "fields": (
+                "id,name,description,followers(total),images,"
+                "tracks(total),external_urls"
+            )
+        },
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
         timeout=30,
     )
 
-    if not response.ok:
+    if response.ok:
+        payload = response.json()
+        followers_total = ((payload.get("followers") or {}).get("total"))
+        if followers_total is not None:
+            return payload
+
+    # Fallback: request the full object when Spotify omits nested fields.
+    fallback = spotify_request(
+        db,
+        account,
+        "GET",
+        endpoint,
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=30,
+    )
+
+    if not fallback.ok:
         return None
 
-    return response.json()
+    return fallback.json()
 
 
 def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: dict | None = None):
@@ -542,18 +578,33 @@ def update_playlist_from_spotify_item(playlist: Playlist, item: dict, detail: di
 
 
 def extract_spotify_followers(item: dict | None, detail: dict | None = None):
-    """Return current total followers from Spotify payload without changing the playlist row."""
-    source = detail or item or {}
-    followers_payload = source.get("followers") or {}
-    followers = followers_payload.get("total")
+    """Return the latest Spotify save count from any supported payload shape."""
+    candidates = []
 
-    if followers is None and item:
-        followers = ((item.get("followers") or {}).get("total"))
+    for source in (detail, item):
+        if not isinstance(source, dict):
+            continue
 
-    try:
-        return int(followers) if followers is not None else None
-    except Exception:
-        return None
+        followers_payload = source.get("followers")
+        if isinstance(followers_payload, dict):
+            candidates.append(followers_payload.get("total"))
+
+        candidates.extend(
+            [
+                source.get("followers_total"),
+                source.get("saves"),
+                source.get("save_count"),
+            ]
+        )
+
+    for value in candidates:
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return None
 
 
 def calculate_daily_growth_from_totals(previous_total, current_total) -> int:
