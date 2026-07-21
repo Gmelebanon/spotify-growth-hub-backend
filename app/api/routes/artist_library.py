@@ -207,10 +207,9 @@ def push_matching_scheduling_rows_online(
             """
             SELECT id, artist, album, song, release_date, status, platform_status
             FROM public.scheduling_rows
-            WHERE LOWER(TRIM(artist)) = LOWER(TRIM(:artist_name))
+            WHERE COALESCE(TRIM(artist), '') <> ''
             """
-        ),
-        {"artist_name": artist_name},
+        )
     )
 
     today = date.today()
@@ -306,6 +305,23 @@ def spotify_get(url: str, access_token: str) -> Dict[str, Any]:
     return response.json()
 
 
+def spotify_get_all_items(url: str, access_token: str) -> List[Dict[str, Any]]:
+    """Follow Spotify pagination until every item has been collected."""
+    items: List[Dict[str, Any]] = []
+    next_url: Optional[str] = url
+
+    while next_url:
+        page = spotify_get(next_url, access_token)
+        page_items = page.get("items") or []
+        if isinstance(page_items, list):
+            items.extend(item for item in page_items if isinstance(item, dict))
+
+        raw_next = page.get("next")
+        next_url = raw_next if isinstance(raw_next, str) and raw_next else None
+
+    return items
+
+
 def get_album_tracks(album_id: str, access_token: str) -> List[Dict[str, Any]]:
     tracks_data = spotify_get(
         f"https://api.spotify.com/v1/albums/{album_id}/tracks?market=US&limit=50",
@@ -365,14 +381,14 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
         access_token,
     )
 
-    albums_data = spotify_get(
+    album_items = spotify_get_all_items(
         f"https://api.spotify.com/v1/artists/{artist_id}/albums"
-        "?include_groups=album,single,appears_on,compilation&market=US&limit=50",
+        "?include_groups=album,single&market=US&limit=50",
         access_token,
     )
 
     unique_releases: Dict[str, Dict[str, Any]] = {}
-    for release in albums_data.get("items") or []:
+    for release in album_items:
         release_id = release.get("id")
         if release_id and release_id not in unique_releases:
             unique_releases[release_id] = release
@@ -388,7 +404,7 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
     recent_raw_releases = []
     for release in releases:
         days_ago = get_release_days_ago(release.get("release_date"))
-        if days_ago is not None and 0 <= days_ago <= 60:
+        if days_ago is not None and 0 <= days_ago <= 365:
             recent_raw_releases.append(release)
 
     latest_release = normalize_release(releases[0], access_token) if releases else None
@@ -848,7 +864,14 @@ def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
                         "totalReleases": metadata["total_releases"],
                         "totalTracks": metadata["total_tracks"],
                         "recentReleases": len(metadata["recent_releases"]),
+                        "spotifyAlbumsMatched": len(
+                            build_spotify_release_references(metadata)["albums"]
+                        ),
+                        "spotifySongsMatched": len(
+                            build_spotify_release_references(metadata)["songs"]
+                        ),
                         "pushedOnline": len(updated_schedule_ids),
+                        "pushedOnlineIds": updated_schedule_ids,
                         "message": "Artist metadata synced",
                     }
                 )
