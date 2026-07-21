@@ -111,6 +111,154 @@ def get_release_days_ago(release_date: Optional[str]) -> Optional[int]:
     return (date.today() - release_day).days
 
 
+
+def normalize_match_value(value: Any) -> str:
+    import unicodedata
+    import re
+
+    normalized = unicodedata.normalize("NFD", str(value or ""))
+    normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+    normalized = normalized.lower().replace("&", " and ")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def parse_scheduling_release_date(value: Any) -> Optional[date]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    for date_format in (
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%Y-%m-%d",
+        "%m-%d-%Y",
+        "%Y.%m.%d",
+        "%m.%d.%Y",
+    ):
+        try:
+            return datetime.strptime(raw, date_format).date()
+        except ValueError:
+            continue
+
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def build_spotify_release_references(metadata: Dict[str, Any]) -> Dict[str, set[str]]:
+    album_names: set[str] = set()
+    song_names: set[str] = set()
+
+    releases: List[Dict[str, Any]] = []
+    latest_release = metadata.get("latest_release")
+    if isinstance(latest_release, dict):
+        releases.append(latest_release)
+
+    recent_releases = metadata.get("recent_releases") or []
+    if isinstance(recent_releases, list):
+        releases.extend(
+            release for release in recent_releases if isinstance(release, dict)
+        )
+
+    seen_release_ids: set[str] = set()
+    for release in releases:
+        release_id = str(release.get("id") or "")
+        if release_id and release_id in seen_release_ids:
+            continue
+        if release_id:
+            seen_release_ids.add(release_id)
+
+        album_name = normalize_match_value(release.get("name"))
+        if album_name:
+            album_names.add(album_name)
+
+        tracks = release.get("tracks") or []
+        if isinstance(tracks, list):
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                song_name = normalize_match_value(track.get("name"))
+                if song_name:
+                    song_names.add(song_name)
+
+    return {"albums": album_names, "songs": song_names}
+
+
+def push_matching_scheduling_rows_online(
+    db: Session,
+    artist_name: str,
+    metadata: Dict[str, Any],
+) -> List[int]:
+    normalized_artist = normalize_match_value(artist_name)
+    if not normalized_artist:
+        return []
+
+    references = build_spotify_release_references(metadata)
+    album_names = references["albums"]
+    song_names = references["songs"]
+
+    if not album_names and not song_names:
+        return []
+
+    result = db.execute(
+        text(
+            """
+            SELECT id, artist, album, song, release_date, status, platform_status
+            FROM public.scheduling_rows
+            WHERE LOWER(TRIM(artist)) = LOWER(TRIM(:artist_name))
+            """
+        ),
+        {"artist_name": artist_name},
+    )
+
+    today = date.today()
+    matching_ids: List[int] = []
+
+    for row in result.fetchall():
+        scheduling_row = to_dict(row)
+        stored_status = str(scheduling_row.get("status") or "").strip()
+
+        if stored_status in {"Online", "Rejected", "No Artist"}:
+            continue
+
+        release_day = parse_scheduling_release_date(scheduling_row.get("release_date"))
+        if release_day is None or release_day > today:
+            continue
+
+        row_artist = normalize_match_value(scheduling_row.get("artist"))
+        row_album = normalize_match_value(scheduling_row.get("album"))
+        row_song = normalize_match_value(scheduling_row.get("song"))
+
+        if row_artist != normalized_artist:
+            continue
+
+        album_match = bool(row_album and row_album in album_names)
+        song_match = bool(row_song and row_song in song_names)
+
+        if album_match or song_match:
+            matching_ids.append(int(scheduling_row["id"]))
+
+    if not matching_ids:
+        return []
+
+    updated = db.execute(
+        text(
+            """
+            UPDATE public.scheduling_rows
+            SET status = 'Online',
+                platform_status = 'online'
+            WHERE id = ANY(:row_ids)
+            RETURNING id
+            """
+        ),
+        {"row_ids": matching_ids},
+    ).fetchall()
+
+    return [int(to_dict(row)["id"]) for row in updated]
+
+
 def get_spotify_access_token() -> str:
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
@@ -240,7 +388,7 @@ def fetch_spotify_artist_metadata(artist_id: str, access_token: str) -> Dict[str
     recent_raw_releases = []
     for release in releases:
         days_ago = get_release_days_ago(release.get("release_date"))
-        if days_ago is not None and 0 <= days_ago <= 7:
+        if days_ago is not None and 0 <= days_ago <= 60:
             recent_raw_releases.append(release)
 
     latest_release = normalize_release(releases[0], access_token) if releases else None
@@ -620,6 +768,7 @@ def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
         results = []
         synced_count = 0
         failed_count = 0
+        pushed_online_ids: set[int] = set()
 
         for artist in artists:
             artist_id = artist.get("artist_id")
@@ -680,6 +829,13 @@ def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
                         "created_at": now,
                     },
                 )
+
+                updated_schedule_ids = push_matching_scheduling_rows_online(
+                    db=db,
+                    artist_name=metadata["name"],
+                    metadata=metadata,
+                )
+                pushed_online_ids.update(updated_schedule_ids)
                 db.commit()
 
                 synced_count += 1
@@ -692,6 +848,7 @@ def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
                         "totalReleases": metadata["total_releases"],
                         "totalTracks": metadata["total_tracks"],
                         "recentReleases": len(metadata["recent_releases"]),
+                        "pushedOnline": len(updated_schedule_ids),
                         "message": "Artist metadata synced",
                     }
                 )
@@ -714,6 +871,8 @@ def sync_metadata(db: Session = Depends(get_db)) -> Dict[str, Any]:
             "total": len(artists),
             "synced": synced_count,
             "failed": failed_count,
+            "pushedOnline": len(pushed_online_ids),
+            "pushedOnlineIds": sorted(pushed_online_ids),
             "snapshotDate": today.isoformat(),
             "results": results,
         }
