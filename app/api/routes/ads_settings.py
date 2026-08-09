@@ -269,17 +269,17 @@ def save_ads_settings(payload: dict):
                     NOW()
                 )
                 ON CONFLICT (playlist_id) DO UPDATE SET
-                    playlist_name = EXCLUDED.playlist_name,
-                    account_name = EXCLUDED.account_name,
+                    playlist_name = COALESCE(EXCLUDED.playlist_name, ads_playlist_settings.playlist_name),
+                    account_name = COALESCE(EXCLUDED.account_name, ads_playlist_settings.account_name),
                     category = EXCLUDED.category,
                     genre = EXCLUDED.genre,
                     country = EXCLUDED.country,
                     master_playlist = EXCLUDED.master_playlist,
                     ad_date = EXCLUDED.ad_date,
-                    campaign_status = EXCLUDED.campaign_status,
-                    budget = EXCLUDED.budget,
-                    followers = EXCLUDED.followers,
-                    last_synced = EXCLUDED.last_synced,
+                    campaign_status = COALESCE(EXCLUDED.campaign_status, ads_playlist_settings.campaign_status),
+                    budget = COALESCE(EXCLUDED.budget, ads_playlist_settings.budget),
+                    followers = COALESCE(EXCLUDED.followers, ads_playlist_settings.followers),
+                    last_synced = COALESCE(EXCLUDED.last_synced, ads_playlist_settings.last_synced),
                     settings = EXCLUDED.settings,
                     is_deleted = FALSE,
                     deleted_at = NULL,
