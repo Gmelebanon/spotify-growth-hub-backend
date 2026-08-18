@@ -3,6 +3,7 @@ import re
 import random
 import time
 import threading
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
@@ -20,6 +21,7 @@ from app.models.ads_meta import AdsMeta
 from app.models.spotify_account import SpotifyAccount
 
 router = APIRouter(tags=["playlists"])
+logger = logging.getLogger(__name__)
 
 
 SPOTIFY_REQUEST_DELAY_SECONDS = float(os.getenv("SPOTIFY_REQUEST_DELAY_SECONDS", "0.45"))
@@ -795,10 +797,41 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
 
         previous_total = None if is_new_playlist else getattr(playlist, "followers", None)
 
-        detail = fetch_spotify_playlist_detail(db, account, spotify_id)
-        current_total = extract_spotify_followers(item, detail)
+        detail = None
+        current_total = None
+
+        for attempt in range(3):
+            detail = fetch_spotify_playlist_detail(db, account, spotify_id)
+            current_total = extract_spotify_followers(item, detail)
+
+            if current_total is not None:
+                break
+
+            logger.warning(
+                "Playlist '%s' (%s): missing follower count from Spotify (attempt %s/3)",
+                item.get("name"),
+                spotify_id,
+                attempt + 1,
+            )
+            time.sleep(2)
+
+        if current_total is None:
+            logger.error(
+                "Skipping playlist '%s' (%s): Spotify never returned follower count.",
+                item.get("name"),
+                spotify_id,
+            )
+            continue
 
         daily_growth = calculate_daily_growth_from_totals(previous_total, current_total)
+
+        logger.info(
+            "SYNC | %s | previous=%s current=%s growth=%s",
+            item.get("name"),
+            previous_total,
+            current_total,
+            daily_growth,
+        )
 
         update_playlist_from_spotify_item(playlist, item, detail)
 
