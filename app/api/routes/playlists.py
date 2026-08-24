@@ -609,27 +609,31 @@ def extract_spotify_followers(item: dict | None, detail: dict | None = None):
     return None
 
 
-def calculate_daily_growth_from_totals(previous_total, current_total) -> int:
+def calculate_daily_growth_from_totals(previous_total, current_total) -> tuple[int, bool]:
     """Calculate daily growth safely from total follower snapshots.
 
     follower_history.followers is used by the frontend as the daily value,
     so Spotify total followers must never be inserted directly into that table.
+
+    Returns (delta, was_suspicious). was_suspicious is True when the delta
+    was large enough to be discarded as a likely data glitch — callers should
+    surface this rather than let it silently look like "no change happened".
     """
     if current_total is None:
-        return 0
+        return 0, False
 
     try:
         current_total = int(current_total)
     except Exception:
-        return 0
+        return 0, False
 
     if previous_total is None:
-        return 0
+        return 0, False
 
     try:
         previous_total = int(previous_total)
     except Exception:
-        return 0
+        return 0, False
 
     delta = current_total - previous_total
 
@@ -640,9 +644,9 @@ def calculate_daily_growth_from_totals(previous_total, current_total) -> int:
             f"Skipped suspicious daily growth value: previous={previous_total} "
             f"current={current_total} delta={delta}"
         )
-        return 0
+        return 0, True
 
-    return delta
+    return delta, False
 
 
 def get_existing_history_for_date(db: Session, playlist_id: int, target_date):
@@ -758,6 +762,7 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
     updated = 0
     history_inserted = 0
     history_updated = 0
+    skipped_playlists: list[dict] = []
     now = datetime.utcnow()
 
     spotify_ids = [item.get("id") for item in spotify_items if item.get("id")]
@@ -816,14 +821,41 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
             time.sleep(2)
 
         if current_total is None:
+            reason = "Spotify did not return a follower count after 3 attempts"
             logger.error(
-                "Skipping playlist '%s' (%s): Spotify never returned follower count.",
+                "Skipping playlist '%s' (%s): %s.",
                 item.get("name"),
                 spotify_id,
+                reason,
+            )
+            skipped_playlists.append(
+                {
+                    "playlist_id": getattr(playlist, "id", None),
+                    "spotify_id": spotify_id,
+                    "name": item.get("name"),
+                    "reason": reason,
+                }
             )
             continue
 
-        daily_growth = calculate_daily_growth_from_totals(previous_total, current_total)
+        daily_growth, was_suspicious = calculate_daily_growth_from_totals(
+            previous_total, current_total
+        )
+
+        if was_suspicious:
+            skipped_playlists.append(
+                {
+                    "playlist_id": getattr(playlist, "id", None),
+                    "spotify_id": spotify_id,
+                    "name": item.get("name"),
+                    "reason": (
+                        f"Follower total jumped from {previous_total} to {current_total} "
+                        f"in one sync (over the {SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT}-follower "
+                        "sanity limit) — total was updated, but today's daily growth was "
+                        "recorded as 0 instead of the raw delta"
+                    ),
+                }
+            )
 
         logger.info(
             "SYNC | %s | previous=%s current=%s growth=%s",
@@ -863,6 +895,7 @@ def refresh_account_playlists_from_spotify(db: Session, account_id: int):
         "history_inserted": history_inserted,
         "history_updated": history_updated,
         "total": len(spotify_items),
+        "skipped_playlists": skipped_playlists,
     }
 
 
@@ -995,6 +1028,7 @@ def sync_account_playlists_api(
         "total": result["total"],
         "history_inserted": result.get("history_inserted", 0),
         "history_updated": result.get("history_updated", 0),
+        "skipped_playlists": result.get("skipped_playlists", []),
         "items": serialize_playlist_batch(
             playlists,
             get_history_rows_for_playlists(db, playlist_ids, days_back=45),
@@ -1083,20 +1117,48 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
     spotify_id = getattr(playlist, "spotify_id", None)
     now = datetime.utcnow()
     daily_growth = 0
+    was_suspicious = False
+    current_total = None
 
-    if spotify_id:
-        previous_total = getattr(playlist, "followers", None)
-        detail = fetch_spotify_playlist_detail(db, account, spotify_id)
-        if detail:
-            current_total = extract_spotify_followers(detail, detail)
-            daily_growth = calculate_daily_growth_from_totals(previous_total, current_total)
+    if not spotify_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This playlist has no linked Spotify ID, so it can't be synced.",
+        )
 
-            update_playlist_from_spotify_item(playlist, detail, detail)
+    previous_total = getattr(playlist, "followers", None)
+    detail = fetch_spotify_playlist_detail(db, account, spotify_id)
 
-            # playlist.followers stores the current Spotify total.
-            # follower_history.followers stores the daily growth value only.
-            if current_total is not None:
-                safe_set(playlist, "followers", current_total)
+    if not detail:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Spotify did not return data for this playlist. It may be "
+                "private, removed, or the linked Spotify ID may be stale — "
+                "nothing was updated."
+            ),
+        )
+
+    current_total = extract_spotify_followers(detail, detail)
+
+    if current_total is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Spotify returned a response but no follower/save count for "
+                "this playlist — nothing was updated."
+            ),
+        )
+
+    daily_growth, was_suspicious = calculate_daily_growth_from_totals(
+        previous_total, current_total
+    )
+
+    update_playlist_from_spotify_item(playlist, detail, detail)
+
+    # playlist.followers stores the current Spotify total.
+    # follower_history.followers stores the daily growth value only.
+    safe_set(playlist, "followers", current_total)
 
     try:
         db.add(playlist)
@@ -1111,7 +1173,18 @@ def sync_playlist_api(account_id: int, playlist_id: int, db: Session = Depends(g
         raise HTTPException(status_code=400, detail=f"Failed to sync playlist history: {exc}")
 
     db.refresh(playlist)
-    return {"message": "Playlist synced", "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id))}
+    response = {
+        "message": "Playlist synced",
+        "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id)),
+    }
+    if was_suspicious:
+        response["warning"] = (
+            f"Follower total jumped from {previous_total} to {current_total} in one "
+            f"sync (over the {SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT}-follower sanity "
+            "limit) — the total was updated, but today's daily growth was recorded "
+            "as 0 instead of the raw delta."
+        )
+    return response
 
 
 @router.post("/accounts/{account_id}/playlists/{playlist_id}/sync")
@@ -1331,6 +1404,7 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
         history_inserted = 0
         history_updated = 0
         total_playlists = 0
+        skipped_playlists: list[dict] = []
 
         for index, account_id in enumerate(account_ids):
             try:
@@ -1339,6 +1413,8 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
                 history_inserted += result.get("history_inserted", 0)
                 history_updated += result.get("history_updated", 0)
                 total_playlists += result.get("total", 0)
+                for skip in result.get("skipped_playlists", []):
+                    skipped_playlists.append({**skip, "account_id": account_id})
                 print(f"Synced account {account_id}: {result}")
             except Exception as exc:
                 db.rollback()
@@ -1359,6 +1435,7 @@ def sync_all_playlists_api(db: Session = Depends(get_db)):
             "history_inserted": history_inserted,
             "history_updated": history_updated,
             "total_playlists": total_playlists,
+            "skipped_playlists": skipped_playlists,
         }
         return result_payload
 
