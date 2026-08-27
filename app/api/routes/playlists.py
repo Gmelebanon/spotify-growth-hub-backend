@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 SPOTIFY_REQUEST_DELAY_SECONDS = float(os.getenv("SPOTIFY_REQUEST_DELAY_SECONDS", "0.45"))
 SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS = float(os.getenv("SPOTIFY_ACCOUNT_SYNC_COOLDOWN_SECONDS", "5"))
 SPOTIFY_MAX_RETRIES = int(os.getenv("SPOTIFY_MAX_RETRIES", "4"))
-SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT = int(os.getenv("SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT", "100"))
+SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT = int(os.getenv("SPOTIFY_SUSPICIOUS_DAILY_VALUE_LIMIT", "10000"))
 SYNC_ALL_COOLDOWN_SECONDS = int(os.getenv("SYNC_ALL_COOLDOWN_SECONDS", "900"))
 
 SYNC_ALL_LOCK = threading.RLock()
@@ -667,16 +667,18 @@ def get_existing_history_for_date(db: Session, playlist_id: int, target_date):
 
 
 def save_daily_growth_history(db: Session, playlist_id: int, daily_growth: int, now: datetime):
-    """Insert or accumulate the daily growth value for a playlist.
+    """Insert or replace the daily growth value for a playlist.
 
-    If sync runs multiple times in the same day, the new delta is added to the
-    existing daily row instead of replacing it with zero.
+    If sync runs multiple times in the same day, the row is set to the
+    latest computed delta rather than accumulated — accumulating caused
+    repeated same-day syncs to inflate the day's total (e.g. +55, then
+    +110, then +165 instead of +55 each time).
     """
     target_date = now.date()
     existing = get_existing_history_for_date(db, playlist_id, target_date)
 
     if existing:
-        existing.followers = (existing.followers or 0) + (daily_growth or 0)
+        existing.followers = daily_growth or 0
         existing.created_at = now
         if hasattr(existing, "date"):
             existing.date = target_date
@@ -729,12 +731,16 @@ def save_daily_growth_history_from_map(
     now: datetime,
     existing_by_playlist_id: Dict[int, FollowerHistory],
 ):
-    """Insert/update daily growth using a preloaded map to avoid one query per playlist."""
+    """Insert/update daily growth using a preloaded map to avoid one query per playlist.
+
+    Same-day reruns replace the row with the latest computed delta rather
+    than accumulating it (see save_daily_growth_history for why).
+    """
     target_date = now.date()
     existing = existing_by_playlist_id.get(playlist_id)
 
     if existing:
-        existing.followers = (existing.followers or 0) + (daily_growth or 0)
+        existing.followers = daily_growth or 0
         existing.created_at = now
         if hasattr(existing, "date"):
             existing.date = target_date
