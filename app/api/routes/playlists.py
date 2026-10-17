@@ -142,7 +142,7 @@ def refresh_spotify_access_token(db: Session, account: SpotifyAccount) -> str:
     if not response.ok:
         raise HTTPException(
             status_code=401,
-            detail=f"Failed to refresh Spotify token: {response.text}",
+            detail="Spotify token refresh rejected. Reconnect this Spotify account or check Spotify OAuth credentials.",
         )
 
     data = response.json()
@@ -915,7 +915,7 @@ def fetch_playlist_tracks_from_spotify(db: Session, account: SpotifyAccount, spo
             db,
             account,
             "GET",
-            f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/tracks",
+            f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/items",
             params={"limit": limit, "offset": offset},
             timeout=30,
         )
@@ -1249,18 +1249,28 @@ def resolve_track_uri(db: Session, track: ReplacePlaylistTrackPayload, account: 
 
 
 def clear_playlist_on_spotify(db: Session, account: SpotifyAccount, spotify_playlist_id: str):
+    """Compatibility helper. Avoid using this before replacement; it is destructive."""
     response = spotify_request(
-        db,
-        account,
-        "PUT",
-        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/tracks",
+        db, account, "PUT",
+        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/items",
         json={"uris": []},
     )
+    if not response.ok:
+        raise HTTPException(status_code=response.status_code,
+                            detail=f"Spotify clear playlist failed: {response.text[:500]}")
 
+
+def replace_first_tracks_on_spotify(db: Session, account: SpotifyAccount, spotify_playlist_id: str, track_uris: list[str]):
+    """Replace in one Spotify request, never clear the playlist first."""
+    response = spotify_request(
+        db, account, "PUT",
+        f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/items",
+        json={"uris": track_uris[:100]},
+    )
     if not response.ok:
         raise HTTPException(
             status_code=response.status_code,
-            detail=f"Spotify clear playlist failed: {response.text}",
+            detail=f"Spotify replace tracks failed ({response.status_code}): {response.text[:500]}",
         )
 
 
@@ -1272,7 +1282,7 @@ def add_tracks_to_spotify_playlist(db: Session, account: SpotifyAccount, spotify
             db,
             account,
             "POST",
-            f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/tracks",
+            f"https://api.spotify.com/v1/playlists/{spotify_playlist_id}/items",
             json={"uris": chunk},
         )
 
@@ -1310,8 +1320,9 @@ def replace_playlist_tracks_logic(account_id: int, playlist_id: int, payload: Re
     if not track_uris:
         raise HTTPException(status_code=400, detail="No valid tracks found")
 
-    clear_playlist_on_spotify(db, account, spotify_playlist_id)
-    add_tracks_to_spotify_playlist(db, account, spotify_playlist_id, track_uris)
+    replace_first_tracks_on_spotify(db, account, spotify_playlist_id, track_uris)
+    if len(track_uris) > 100:
+        add_tracks_to_spotify_playlist(db, account, spotify_playlist_id, track_uris[100:])
 
     safe_set(playlist, "tracks_count", len(track_uris))
     safe_set(playlist, "tracks_total", len(track_uris))
@@ -1323,7 +1334,7 @@ def replace_playlist_tracks_logic(account_id: int, playlist_id: int, payload: Re
     db.refresh(playlist)
 
     return {
-        "message": "Playlist cleared and replaced successfully",
+        "message": "Playlist replaced successfully",
         "playlist": serialize_playlist(playlist, get_history_rows(db, playlist.id)),
         "synced_tracks": len(track_uris),
         "unresolved_tracks": unresolved,
