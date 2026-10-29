@@ -148,42 +148,52 @@ def parse_scheduling_release_date(value: Any) -> Optional[date]:
 
 
 def build_spotify_release_references(metadata: Dict[str, Any]) -> Dict[str, set[str]]:
+    """Build normalized references from Spotify releases already available today."""
     album_names: set[str] = set()
     song_names: set[str] = set()
-
-    releases: List[Dict[str, Any]] = []
-    latest_release = metadata.get("latest_release")
-    if isinstance(latest_release, dict):
-        releases.append(latest_release)
-
-    recent_releases = metadata.get("recent_releases") or []
-    if isinstance(recent_releases, list):
-        releases.extend(
-            release for release in recent_releases if isinstance(release, dict)
-        )
-
-    seen_release_ids: set[str] = set()
-    for release in releases:
-        release_id = str(release.get("id") or "")
-        if release_id and release_id in seen_release_ids:
-            continue
-        if release_id:
-            seen_release_ids.add(release_id)
-
+    for release in get_available_spotify_releases(metadata):
         album_name = normalize_match_value(release.get("name"))
         if album_name:
             album_names.add(album_name)
-
-        tracks = release.get("tracks") or []
-        if isinstance(tracks, list):
-            for track in tracks:
-                if not isinstance(track, dict):
-                    continue
-                song_name = normalize_match_value(track.get("name"))
-                if song_name:
-                    song_names.add(song_name)
-
+        for track in release.get("tracks") or []:
+            if isinstance(track, dict):
+                track_name = normalize_match_value(track.get("name"))
+                if track_name:
+                    song_names.add(track_name)
     return {"albums": album_names, "songs": song_names}
+
+
+def get_available_spotify_releases(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Only consider Spotify releases dated today or earlier (UTC)."""
+    candidates: List[Dict[str, Any]] = []
+    latest = metadata.get("latest_release")
+    if isinstance(latest, dict):
+        candidates.append(latest)
+    recent = metadata.get("recent_releases") or []
+    if isinstance(recent, list):
+        candidates.extend(item for item in recent if isinstance(item, dict))
+
+    today = datetime.now(timezone.utc).date()
+    seen: set[str] = set()
+    available: List[Dict[str, Any]] = []
+    for release in candidates:
+        release_id = str(release.get("id") or "")
+        key = release_id or normalize_match_value(release.get("name"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        raw_date = str(release.get("releaseDate") or release.get("release_date") or "")
+        # Spotify can return YYYY, YYYY-MM, or YYYY-MM-DD. Avoid treating
+        # an imprecise future release date as confirmed availability.
+        if len(raw_date) != 10:
+            continue
+        try:
+            spotify_day = date.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        if spotify_day <= today:
+            available.append(release)
+    return available
 
 
 def push_matching_scheduling_rows_online(
@@ -191,18 +201,26 @@ def push_matching_scheduling_rows_online(
     artist_name: str,
     metadata: Dict[str, Any],
 ) -> List[int]:
+    """Mark a row Online only when a corresponding Spotify release is dated live.
+
+    Scheduling dates are plans, not proof of availability. Match the artist and
+    album or song title, using the Spotify release date as the date gate.
+    """
     normalized_artist = normalize_match_value(artist_name)
     if not normalized_artist:
+        return []
+
+    releases = get_available_spotify_releases(metadata)
+    if not releases:
         return []
 
     references = build_spotify_release_references(metadata)
     album_names = references["albums"]
     song_names = references["songs"]
-
     if not album_names and not song_names:
         return []
 
-    result = db.execute(
+    rows = db.execute(
         text(
             """
             SELECT id, artist, album, song, release_date, status, platform_status
@@ -210,34 +228,27 @@ def push_matching_scheduling_rows_online(
             WHERE COALESCE(TRIM(artist), '') <> ''
             """
         )
-    )
+    ).fetchall()
 
-    today = date.today()
     matching_ids: List[int] = []
-
-    for row in result.fetchall():
-        scheduling_row = to_dict(row)
-        stored_status = str(scheduling_row.get("status") or "").strip()
-
-        if stored_status in {"Online", "Rejected", "No Artist"}:
+    for row in rows:
+        item = to_dict(row)
+        status = normalize_match_value(item.get("status"))
+        if status in {"online", "rejected", "no artist"}:
+            continue
+        if normalize_match_value(item.get("artist")) != normalized_artist:
             continue
 
-        release_day = parse_scheduling_release_date(scheduling_row.get("release_date"))
-        if release_day is None or release_day > today:
-            continue
+        album = normalize_match_value(item.get("album"))
+        song = normalize_match_value(item.get("song"))
+        # A dash is the scheduling convention for a standalone single.
+        if album in {"", "-"}:
+            album = ""
+        if song in {"", "-"}:
+            song = ""
 
-        row_artist = normalize_match_value(scheduling_row.get("artist"))
-        row_album = normalize_match_value(scheduling_row.get("album"))
-        row_song = normalize_match_value(scheduling_row.get("song"))
-
-        if row_artist != normalized_artist:
-            continue
-
-        album_match = bool(row_album and row_album in album_names)
-        song_match = bool(row_song and row_song in song_names)
-
-        if album_match or song_match:
-            matching_ids.append(int(scheduling_row["id"]))
+        if (album and album in album_names) or (song and song in song_names) or (song and song in album_names):
+            matching_ids.append(int(item["id"]))
 
     if not matching_ids:
         return []
@@ -246,15 +257,14 @@ def push_matching_scheduling_rows_online(
         text(
             """
             UPDATE public.scheduling_rows
-            SET status = 'Online',
-                platform_status = 'online'
+            SET status = 'Online', platform_status = 'online'
             WHERE id = ANY(:row_ids)
+              AND LOWER(TRIM(COALESCE(status, ''))) NOT IN ('online', 'rejected', 'no artist')
             RETURNING id
             """
         ),
         {"row_ids": matching_ids},
     ).fetchall()
-
     return [int(to_dict(row)["id"]) for row in updated]
 
 
@@ -323,10 +333,10 @@ def spotify_get_all_items(url: str, access_token: str) -> List[Dict[str, Any]]:
 
 
 def get_album_tracks(album_id: str, access_token: str) -> List[Dict[str, Any]]:
-    tracks_data = spotify_get(
+    tracks_data = {"items": spotify_get_all_items(
         f"https://api.spotify.com/v1/albums/{album_id}/tracks?market=US&limit=50",
         access_token,
-    )
+    )}
 
     tracks = []
     for track in tracks_data.get("items") or []:
