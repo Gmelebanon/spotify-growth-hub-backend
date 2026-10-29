@@ -8,6 +8,7 @@ from app.core.database import Base, engine
 from app.api.routes import accounts
 from app.api.routes import ads_filter_options
 from app.api.routes import ads_settings
+from app.api.routes import daily_artist_sync
 from app.api.routes import artist_library
 from app.api.routes import artist_manual_data
 from app.api.routes import curation
@@ -116,6 +117,7 @@ app.include_router(curation_csv_playlists.router)
 app.include_router(ads_settings.router)
 app.include_router(ads_filter_options.router)
 app.include_router(artist_library.router)
+app.include_router(daily_artist_sync.router)
 app.include_router(artist_manual_data.router)
 app.include_router(song_metrics_router)
 app.include_router(settings.router)
