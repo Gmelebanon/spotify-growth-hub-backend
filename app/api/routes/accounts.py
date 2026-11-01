@@ -211,3 +211,83 @@ def create_account(payload: CreateAccountRequest, db: Session = Depends(get_db))
         "spotify_user_id": account.spotify_user_id,
         "email": account.email,
     }
+
+@router.post("/accounts/{account_id}/refresh")
+def refresh_account_spotify_api(account_id: int, db: Session = Depends(get_db)):
+    """Refresh only the selected Spotify account's OAuth credentials and profile."""
+    account = db.query(SpotifyAccount).filter(SpotifyAccount.id == account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not account.refresh_token:
+        raise HTTPException(status_code=409, detail="No refresh token saved. Reconnect this Spotify account.")
+
+    client_id = os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="Spotify client credentials are not configured")
+
+    try:
+        token_response = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "refresh_token", "refresh_token": account.refresh_token},
+            auth=(client_id, client_secret),
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Could not reach Spotify token API")
+
+    if not token_response.ok:
+        if token_response.status_code in (400, 401):
+            raise HTTPException(status_code=409, detail="Spotify refresh token rejected. Reconnect this account.")
+        raise HTTPException(status_code=502, detail=f"Spotify token API returned HTTP {token_response.status_code}")
+
+    try:
+        token_data = token_response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid response from Spotify token API")
+    new_access_token = token_data.get("access_token")
+    if not new_access_token:
+        raise HTTPException(status_code=502, detail="Spotify returned no access token")
+
+    try:
+        profile_response = requests.get(
+            "https://api.spotify.com/v1/me",
+            headers={"Authorization": f"Bearer {new_access_token}"},
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Could not verify Spotify profile")
+    if not profile_response.ok:
+        raise HTTPException(status_code=502, detail=f"Spotify profile verification failed (HTTP {profile_response.status_code})")
+
+    try:
+        profile = profile_response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid Spotify profile response")
+
+    if profile.get("id") != account.spotify_user_id:
+        raise HTTPException(status_code=409, detail="Spotify profile does not match the selected account")
+
+    account.access_token = new_access_token
+    if token_data.get("refresh_token"):
+        account.refresh_token = token_data["refresh_token"]
+    if profile.get("display_name"):
+        account.display_name = profile["display_name"]
+    if profile.get("email"):
+        account.email = profile["email"]
+    now = datetime.utcnow()
+    if hasattr(account, "updated_at"):
+        account.updated_at = now
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not save refreshed Spotify credentials")
+
+    return {
+        "success": True,
+        "account_id": account.id,
+        "display_name": account.display_name,
+        "refreshed_at": now.isoformat() + "Z",
+        "message": "Spotify API token and profile refreshed",
+    }
